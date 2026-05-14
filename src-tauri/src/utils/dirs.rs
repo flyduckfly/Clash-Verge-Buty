@@ -114,6 +114,42 @@ pub fn service_log_file() -> Result<PathBuf> {
     Ok(log_file)
 }
 
+#[cfg(windows)]
+pub fn get_latest_service_log_file() -> Result<Option<PathBuf>> {
+    let log_dir = app_logs_dir()?.join("service");
+    if !log_dir.exists() {
+        return Ok(None);
+    }
+    let mut latest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(&log_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("log") {
+            continue;
+        }
+        let modified = entry
+            .metadata()?
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        match &latest {
+            Some((curr, _)) if modified <= *curr => {}
+            _ => latest = Some((modified, path)),
+        }
+    }
+    Ok(latest.map(|(_, p)| p))
+}
+
+pub fn debug_logs_dir() -> Result<PathBuf> {
+    let log_dir = app_logs_dir()?.join("debug");
+    let _ = std::fs::create_dir_all(&log_dir);
+    Ok(log_dir)
+}
+
+pub fn new_debug_log_file() -> Result<PathBuf> {
+    let local_time = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
+    Ok(debug_logs_dir()?.join(format!("debug-{local_time}.log")))
+}
+
 pub fn path_to_str(path: &PathBuf) -> Result<&str> {
     let path_str = path
         .as_os_str()
