@@ -158,8 +158,11 @@ pub struct TunDiagnosticReport {
     pub outbound_group: Option<String>,
     pub selected_proxy: Option<String>,
     pub selected_proxy_type: Option<String>,
+    pub route_decision: Option<String>,
+    pub route_decision_type: Option<String>,
     pub selected_proxy_server_host: Option<String>,
     pub selected_proxy_server_port: Option<u16>,
+    pub selected_proxy_is_direct: bool,
     pub selected_proxy_delay: Option<i64>,
     pub selected_proxy_reachable: Option<bool>,
     pub selected_proxy_delay_error: Option<String>,
@@ -168,6 +171,9 @@ pub struct TunDiagnosticReport {
     pub proxy_dns_failed_targets: Vec<String>,
     pub proxy_dns_failure_hint: Option<String>,
     pub system_dns_resolved_hosts: Vec<SystemDnsResolvedHost>,
+    pub system_dns_status: Option<String>,
+    pub dns_proxy_server_nameserver_status: Option<String>,
+    pub dns_fake_ip_range: Option<String>,
     pub proxy_server_nameserver: Vec<String>,
     pub dns_nameserver: Vec<String>,
     pub dns_respect_rules: Option<bool>,
@@ -181,6 +187,59 @@ pub struct TunDiagnosticReport {
 pub struct SystemDnsResolvedHost {
     pub host: String,
     pub ips: Vec<String>,
+    pub fake_ip_flags: Vec<bool>,
+}
+
+fn ipv4_to_u32(ip: std::net::Ipv4Addr) -> u32 {
+    u32::from_be_bytes(ip.octets())
+}
+
+fn is_ipv4_in_cidr(ip: &str, cidr: &str) -> bool {
+    let (base, prefix_str) = match cidr.split_once('/') {
+        Some(v) => v,
+        None => return false,
+    };
+    let ip = match ip.parse::<std::net::Ipv4Addr>() { Ok(v) => v, Err(_) => return false };
+    let base = match base.parse::<std::net::Ipv4Addr>() { Ok(v) => v, Err(_) => return false };
+    let prefix: u32 = match prefix_str.parse::<u32>() { Ok(v) if v <= 32 => v, _ => return false };
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    (ipv4_to_u32(ip) & mask) == (ipv4_to_u32(base) & mask)
+}
+
+fn is_likely_fake_ip(ip: &str, config_fake_ip_range: Option<&str>) -> bool {
+    if let Some(range) = config_fake_ip_range.map(str::trim).filter(|v| !v.is_empty()) {
+        if is_ipv4_in_cidr(ip, range) {
+            return true;
+        }
+    }
+    is_ipv4_in_cidr(ip, "198.18.0.0/15")
+}
+
+fn is_probably_domain(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_err()
+}
+
+fn classify_system_dns_status(system_dns_resolved_hosts: &[SystemDnsResolvedHost]) -> String {
+    if system_dns_resolved_hosts.is_empty() {
+        return "failed".to_string();
+    }
+    let mut has_fake = false;
+    let mut has_real = false;
+    for item in system_dns_resolved_hosts {
+        for is_fake in &item.fake_ip_flags {
+            if *is_fake {
+                has_fake = true;
+            } else {
+                has_real = true;
+            }
+        }
+    }
+    match (has_fake, has_real) {
+        (true, true) => "mixed".to_string(),
+        (true, false) => "fake-ip".to_string(),
+        (false, true) => "resolved".to_string(),
+        (false, false) => "failed".to_string(),
+    }
 }
 
 fn collect_string_array(v: Option<&JsonValue>) -> Vec<String> {
@@ -461,6 +520,7 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
     let mut dns_nameserver = vec![];
     let mut dns_respect_rules = None;
     let mut dns_enhanced_mode = None;
+    let mut dns_fake_ip_range = None;
     if let Ok(resp) = cfg_resp {
         if let Ok(v) = resp.json::<JsonValue>().await {
             mode = v.get("mode").and_then(|m| m.as_str()).map(|s| s.to_string());
@@ -477,6 +537,7 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
                 dns_nameserver = collect_string_array(dns.get("nameserver"));
                 dns_respect_rules = dns.get("respect-rules").and_then(|x| x.as_bool());
                 dns_enhanced_mode = dns.get("enhanced-mode").and_then(|x| x.as_str()).map(|x| x.to_string());
+                dns_fake_ip_range = dns.get("fake-ip-range").and_then(|x| x.as_str()).map(|x| x.to_string());
             }
         }
     }
@@ -505,6 +566,7 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
     let mut selected_proxy_type = None;
     let mut selected_proxy_server_host = None;
     let mut selected_proxy_server_port = None;
+    let mut selected_proxy_is_direct = false;
     let mut selected_proxy_delay = None;
     let mut selected_proxy_reachable = None;
     let mut selected_proxy_delay_error = None;
@@ -528,7 +590,11 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
                 }
             }
         }
-        if let Some(proxy) = selected_proxy.clone() {
+        selected_proxy_is_direct = selected_proxy_type
+            .as_deref()
+            .map(|v| v.eq_ignore_ascii_case("Direct"))
+            .unwrap_or_else(|| selected_proxy.as_deref().map(|v| v.eq_ignore_ascii_case("DIRECT")).unwrap_or(false));
+        if let Some(proxy) = selected_proxy.clone().filter(|_| !selected_proxy_is_direct) {
             let encoded_proxy = encode_url_path_segment(&proxy);
             let url = format!(
                 "http://127.0.0.1:9097/proxies/{encoded_proxy}/delay?timeout=8000&url=https%3A%2F%2Fwww.google.com%2Fgenerate_204"
@@ -547,6 +613,9 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
             if selected_proxy_reachable == Some(false) {
                 reasons.push("TUN is enabled, but selected proxy is not reachable.".to_string());
             }
+        } else if selected_proxy_is_direct {
+            selected_proxy_delay_error = None;
+            reasons.push("route selected DIRECT".to_string());
         }
     }
 
@@ -580,12 +649,19 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
         }
     }
 
-    if let Some(err) = selected_proxy_delay_error.as_deref() {
-        if err.to_lowercase().contains("dns resolve failed") {
-            proxy_dns_failed = true;
+    if !selected_proxy_is_direct {
+        if let Some(err) = selected_proxy_delay_error.as_deref() {
+            if err.to_lowercase().contains("dns resolve failed") {
+                proxy_dns_failed = true;
+            }
         }
     }
-    if proxy_dns_failed {
+    let proxy_server_host_is_domain = selected_proxy_server_host
+        .as_deref()
+        .map(is_probably_domain)
+        .unwrap_or(false);
+    let should_check_proxy_dns = proxy_server_host_is_domain && !selected_proxy_is_direct;
+    if proxy_dns_failed && should_check_proxy_dns {
         if let Some(host) = selected_proxy_server_host.clone() {
             if !proxy_dns_failed_hosts.iter().any(|h| h == &host) {
                 proxy_dns_failed_hosts.push(host);
@@ -598,27 +674,52 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
     proxy_dns_failed_targets.dedup();
 
     let mut system_dns_resolved_hosts = vec![];
-    if proxy_dns_failed {
+    if proxy_dns_failed && should_check_proxy_dns {
         for host in proxy_dns_failed_hosts.iter().take(3) {
             if let Ok(Ok(iter)) = timeout(Duration::from_secs(2), lookup_host((host.as_str(), 0))).await {
                 let mut ips: Vec<String> = iter.map(|addr| addr.ip().to_string()).collect();
                 ips.sort();
                 ips.dedup();
                 if !ips.is_empty() {
-                    system_dns_resolved_hosts.push(SystemDnsResolvedHost { host: host.clone(), ips });
+                    let fake_ip_flags = ips
+                        .iter()
+                        .map(|ip| is_likely_fake_ip(ip, dns_fake_ip_range.as_deref()))
+                        .collect();
+                    system_dns_resolved_hosts.push(SystemDnsResolvedHost { host: host.clone(), ips, fake_ip_flags });
                 }
             }
         }
     }
 
+    let system_dns_status = if !proxy_dns_failed || !should_check_proxy_dns {
+        Some("not_tested".to_string())
+    } else {
+        Some(classify_system_dns_status(&system_dns_resolved_hosts))
+    };
+
+    let dns_proxy_server_nameserver_status = if !proxy_server_host_is_domain {
+        Some("unknown".to_string())
+    } else if proxy_server_nameserver.is_empty() {
+        Some("implicit_fallback".to_string())
+    } else {
+        Some("configured".to_string())
+    };
+
     let mut proxy_dns_failure_hint = None;
+    proxy_dns_failed = proxy_dns_failed && should_check_proxy_dns;
     if proxy_dns_failed {
         reasons.push("selected proxy DNS failed".to_string());
-        proxy_dns_failure_hint = Some(if system_dns_resolved_hosts.is_empty() {
+        proxy_dns_failure_hint = Some(if system_dns_status.as_deref() == Some("fake-ip") {
+            "系统 DNS 返回了 fake-ip，这通常来自 Mihomo fake-ip/TUN DNS hijack，不代表代理节点域名已解析到真实公网地址。代理节点域名应通过 proxy-server-nameserver 或 Mihomo 内部 DNS 解析。请检查 dns.proxy-server-nameserver、nameserver、fake-ip-filter、respect-rules 以及 DNS 出站路径。".to_string()
+        } else if system_dns_status.as_deref() == Some("mixed") {
+            "系统 DNS 返回了 fake-ip 与真实 IP 的混合结果。fake-ip 可能来自 Mihomo fake-ip/TUN DNS hijack，不能单独作为代理节点真实解析成功的依据。请优先检查 dns.proxy-server-nameserver、nameserver、fake-ip-filter、respect-rules 与 DNS 出站路径。".to_string()
+        } else if system_dns_resolved_hosts.is_empty() {
             "当前选中代理节点的服务器域名在 Mihomo 内部解析失败，但这不一定代表域名本身失效。请检查 proxy-server-nameserver、respect-rules、DNS 出站路径或 TUN 回环。".to_string()
         } else {
-            "系统 DNS 可以解析该代理服务器域名，但 Mihomo 内部 DNS 解析失败。请检查 proxy-server-nameserver、respect-rules、DNS 出站路径或 TUN 回环。".to_string()
+            "系统 DNS 解析到了真实 IP，但 Mihomo 内部 DNS 对代理节点域名解析失败。请检查 dns.proxy-server-nameserver、nameserver、respect-rules 与 DNS 出站路径。".to_string()
         });
+    } else if selected_proxy_is_direct {
+        proxy_dns_failure_hint = Some("当前路由选择为 DIRECT；DIRECT 不是代理节点，因此跳过节点延迟测试和节点 DNS 诊断。".to_string());
     }
 
     if tun_enabled && dns_hijack_ok && route_injected && selected_proxy_reachable != Some(true) && !reasons.iter().any(|r| r.contains("selected proxy")) {
@@ -637,8 +738,11 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
         outbound_group,
         selected_proxy,
         selected_proxy_type,
+        route_decision: selected_proxy.clone(),
+        route_decision_type: selected_proxy_type.clone(),
         selected_proxy_server_host,
         selected_proxy_server_port,
+        selected_proxy_is_direct,
         selected_proxy_delay,
         selected_proxy_reachable,
         selected_proxy_delay_error,
@@ -647,6 +751,9 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
         proxy_dns_failed_targets,
         proxy_dns_failure_hint,
         system_dns_resolved_hosts,
+        system_dns_status,
+        dns_proxy_server_nameserver_status,
+        dns_fake_ip_range,
         proxy_server_nameserver,
         dns_nameserver,
         dns_respect_rules,
@@ -655,4 +762,65 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
         service_log_summary,
         reasons,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_system_dns_status, is_ipv4_in_cidr, is_likely_fake_ip, SystemDnsResolvedHost};
+
+    #[test]
+    fn fake_ip_default_range_works() {
+        assert!(is_likely_fake_ip("198.18.0.14", None));
+        assert!(!is_likely_fake_ip("8.8.8.8", None));
+    }
+
+    #[test]
+    fn fake_ip_uses_config_range() {
+        assert!(is_likely_fake_ip("28.1.2.3", Some("28.0.0.1/8")));
+    }
+
+    #[test]
+    fn fake_ip_invalid_config_falls_back_default_range() {
+        assert!(is_likely_fake_ip("198.18.0.14", Some("not-a-cidr")));
+    }
+
+    #[test]
+    fn cidr_match_works() {
+        assert!(is_ipv4_in_cidr("198.18.10.1", "198.18.0.0/15"));
+        assert!(!is_ipv4_in_cidr("198.20.10.1", "198.18.0.0/15"));
+    }
+
+    #[test]
+    fn system_dns_status_fake_ip_only() {
+        let hosts = vec![SystemDnsResolvedHost {
+            host: "awjp.rocnet.vip".to_string(),
+            ips: vec!["198.18.0.14".to_string()],
+            fake_ip_flags: vec![true],
+        }];
+        assert_eq!(classify_system_dns_status(&hosts), "fake-ip");
+    }
+
+    #[test]
+    fn system_dns_status_mixed() {
+        let hosts = vec![SystemDnsResolvedHost {
+            host: "awjp.rocnet.vip".to_string(),
+            ips: vec!["198.18.0.14".to_string(), "1.1.1.1".to_string()],
+            fake_ip_flags: vec![true, false],
+        }];
+        assert_eq!(classify_system_dns_status(&hosts), "mixed");
+    }
+
+    #[test]
+    fn proxy_server_nameserver_empty_is_implicit_fallback() {
+        let proxy_server_nameserver: Vec<String> = vec![];
+        let is_domain = true;
+        let status = if !is_domain {
+            "unknown"
+        } else if proxy_server_nameserver.is_empty() {
+            "implicit_fallback"
+        } else {
+            "configured"
+        };
+        assert_eq!(status, "implicit_fallback");
+    }
 }
