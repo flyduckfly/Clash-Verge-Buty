@@ -202,10 +202,13 @@ fn read_runtime_config_yaml() -> (
     Option<String>,
 ) {
     let runtime_cfg = Config::runtime().latest().config.clone();
-    if !runtime_cfg.is_null() {
-        if let Ok(v) = serde_yaml::to_value(runtime_cfg) {
-            return (Some(v), "runtime_config".to_string(), None, None);
-        }
+    if let Some(runtime_cfg) = runtime_cfg.as_ref() {
+        return (
+            Some(serde_yaml::Value::Mapping(runtime_cfg.clone())),
+            "runtime_config".to_string(),
+            None,
+            None,
+        );
     }
     let final_config_path = dirs::app_home_dir()
         .ok()
