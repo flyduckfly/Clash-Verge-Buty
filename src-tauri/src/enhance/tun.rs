@@ -1,9 +1,7 @@
-use serde_yaml::{Mapping, Value};
 use crate::core::handle::Handle;
-const DEFAULT_PROXY_SERVER_NAMESERVER: [&str; 2] = [
-    "https://223.5.5.5/dns-query",
-    "https://223.6.6.6/dns-query",
-];
+use serde_yaml::{Mapping, Value};
+const DEFAULT_PROXY_SERVER_NAMESERVER: [&str; 2] =
+    ["https://223.5.5.5/dns-query", "https://223.6.6.6/dns-query"];
 
 macro_rules! revise {
     ($map: expr, $key: expr, $val: expr) => {
@@ -28,6 +26,24 @@ pub fn use_tun(
     source_has_tun: bool,
     default_tun: Mapping,
 ) -> Mapping {
+    fn fill_missing_tun_defaults(tun_val: &mut Mapping, default_tun: &Mapping) {
+        for key in [
+            "dns-hijack",
+            "stack",
+            "auto-route",
+            "strict-route",
+            "auto-detect-interface",
+            "mtu",
+            "inet4-address",
+        ] {
+            let key_val = Value::from(key);
+            if !tun_val.contains_key(&key_val) {
+                if let Some(default) = default_tun.get(&key_val) {
+                    tun_val.insert(key_val, default.clone());
+                }
+            }
+        }
+    }
     let tun_key = Value::from("tun");
     let tun_val = config.get(&tun_key);
     let tun_existed = tun_val.is_some();
@@ -39,9 +55,13 @@ pub fn use_tun(
             .and_then(Value::as_mapping)
             .cloned()
             .unwrap_or_else(|| default_tun.clone());
+        fill_missing_tun_defaults(&mut tun_val, &default_tun);
         revise!(tun_val, "enable", true);
         revise!(config, "tun", tun_val);
-        Handle::emit_log("info", "[tun] action: inject/update tun and set enable=true");
+        Handle::emit_log(
+            "info",
+            "[tun] action: inject/update tun and set enable=true",
+        );
     } else if tun_existed || source_has_tun {
         let mut tun_val = tun_val
             .and_then(Value::as_mapping)
@@ -124,11 +144,14 @@ fn inject_default_proxy_server_nameserver_if_needed(config: &mut Mapping, dns_va
         return;
     }
 
-    let should_inject = dns_val
-        .get("proxy-server-nameserver")
-        .and_then(Value::as_sequence)
-        .map(|seq| seq.is_empty())
-        .unwrap_or(true);
+    let should_inject = match dns_val.get("proxy-server-nameserver") {
+        None => true,
+        Some(Value::Sequence(seq)) => seq.is_empty(),
+        Some(other) => {
+            log::warn!(target: "app", "dns.proxy-server-nameserver has unexpected type ({:?}), fallback to default injection", other);
+            true
+        }
+    };
 
     if should_inject {
         dns_val.insert(
@@ -151,13 +174,23 @@ mod tests {
     use super::use_tun;
     use serde_yaml::{Mapping, Value};
 
-    fn m() -> Mapping { Mapping::new() }
-    fn build_config(tun_enable: bool, dns_hijack: Option<Vec<&str>>, enhanced_mode: Option<&str>, psn: Option<Value>) -> Mapping {
+    fn m() -> Mapping {
+        Mapping::new()
+    }
+    fn build_config(
+        tun_enable: bool,
+        dns_hijack: Option<Vec<&str>>,
+        enhanced_mode: Option<&str>,
+        psn: Option<Value>,
+    ) -> Mapping {
         let mut c = m();
         let mut tun = m();
         tun.insert(Value::from("enable"), Value::from(tun_enable));
         if let Some(h) = dns_hijack {
-            tun.insert(Value::from("dns-hijack"), Value::Sequence(h.into_iter().map(Value::from).collect()));
+            tun.insert(
+                Value::from("dns-hijack"),
+                Value::Sequence(h.into_iter().map(Value::from).collect()),
+            );
         }
         c.insert(Value::from("tun"), Value::Mapping(tun));
         if enhanced_mode.is_some() || psn.is_some() {
@@ -177,23 +210,50 @@ mod tests {
     fn inject_when_dns_missing() {
         let c = build_config(true, Some(vec!["any:53"]), Some("fake-ip"), None);
         let out = use_tun(c, true, true, m());
-        let seq = out.get("dns").and_then(Value::as_mapping).and_then(|d| d.get("proxy-server-nameserver")).and_then(Value::as_sequence).unwrap();
+        let seq = out
+            .get("dns")
+            .and_then(Value::as_mapping)
+            .and_then(|d| d.get("proxy-server-nameserver"))
+            .and_then(Value::as_sequence)
+            .unwrap();
         assert_eq!(seq.len(), 2);
     }
 
     #[test]
     fn keep_user_proxy_server_nameserver() {
-        let c = build_config(true, Some(vec!["any:53"]), Some("fake-ip"), Some(Value::Sequence(vec![Value::from("https://user.dns/dns-query")])));
+        let c = build_config(
+            true,
+            Some(vec!["any:53"]),
+            Some("fake-ip"),
+            Some(Value::Sequence(vec![Value::from(
+                "https://user.dns/dns-query",
+            )])),
+        );
         let out = use_tun(c, true, true, m());
-        let seq = out.get("dns").and_then(Value::as_mapping).and_then(|d| d.get("proxy-server-nameserver")).and_then(Value::as_sequence).unwrap();
+        let seq = out
+            .get("dns")
+            .and_then(Value::as_mapping)
+            .and_then(|d| d.get("proxy-server-nameserver"))
+            .and_then(Value::as_sequence)
+            .unwrap();
         assert_eq!(seq.len(), 1);
     }
 
     #[test]
     fn inject_when_empty_array() {
-        let c = build_config(true, Some(vec!["any:53"]), Some("fake-ip"), Some(Value::Sequence(vec![])));
+        let c = build_config(
+            true,
+            Some(vec!["any:53"]),
+            Some("fake-ip"),
+            Some(Value::Sequence(vec![])),
+        );
         let out = use_tun(c, true, true, m());
-        let seq = out.get("dns").and_then(Value::as_mapping).and_then(|d| d.get("proxy-server-nameserver")).and_then(Value::as_sequence).unwrap();
+        let seq = out
+            .get("dns")
+            .and_then(Value::as_mapping)
+            .and_then(|d| d.get("proxy-server-nameserver"))
+            .and_then(Value::as_sequence)
+            .unwrap();
         assert_eq!(seq.len(), 2);
     }
 
@@ -201,7 +261,11 @@ mod tests {
     fn no_inject_when_tun_disabled() {
         let c = build_config(false, Some(vec!["any:53"]), Some("fake-ip"), None);
         let out = use_tun(c, false, true, m());
-        let has = out.get("dns").and_then(Value::as_mapping).and_then(|d| d.get("proxy-server-nameserver")).is_some();
+        let has = out
+            .get("dns")
+            .and_then(Value::as_mapping)
+            .and_then(|d| d.get("proxy-server-nameserver"))
+            .is_some();
         assert!(!has);
     }
 
@@ -209,7 +273,11 @@ mod tests {
     fn no_inject_when_not_fake_ip_mode() {
         let c = build_config(true, Some(vec!["any:53"]), Some("redir-host"), None);
         let out = use_tun(c, true, true, m());
-        let has = out.get("dns").and_then(Value::as_mapping).and_then(|d| d.get("proxy-server-nameserver")).is_some();
+        let has = out
+            .get("dns")
+            .and_then(Value::as_mapping)
+            .and_then(|d| d.get("proxy-server-nameserver"))
+            .is_some();
         assert!(!has);
     }
 
@@ -217,7 +285,41 @@ mod tests {
     fn no_inject_when_dns_hijack_empty() {
         let c = build_config(true, Some(vec![]), Some("fake-ip"), None);
         let out = use_tun(c, true, true, m());
-        let has = out.get("dns").and_then(Value::as_mapping).and_then(|d| d.get("proxy-server-nameserver")).is_some();
+        let has = out
+            .get("dns")
+            .and_then(Value::as_mapping)
+            .and_then(|d| d.get("proxy-server-nameserver"))
+            .is_some();
         assert!(!has);
+    }
+
+    #[test]
+    fn preserve_existing_tun_dns_hijack_and_fill_missing_defaults() {
+        let mut default_tun = m();
+        default_tun.insert(
+            Value::from("dns-hijack"),
+            Value::Sequence(vec![Value::from("any:53")]),
+        );
+        default_tun.insert(Value::from("stack"), Value::from("system"));
+        default_tun.insert(Value::from("auto-route"), Value::from(true));
+        default_tun.insert(Value::from("strict-route"), Value::from(false));
+        default_tun.insert(Value::from("auto-detect-interface"), Value::from(true));
+        default_tun.insert(Value::from("mtu"), Value::from(9000));
+        default_tun.insert(Value::from("inet4-address"), Value::from("172.19.0.1/30"));
+        let mut c = m();
+        let mut tun = m();
+        tun.insert(
+            Value::from("dns-hijack"),
+            Value::Sequence(vec![Value::from("tcp://any:53")]),
+        );
+        c.insert(Value::from("tun"), Value::Mapping(tun));
+        let out = use_tun(c, true, true, default_tun);
+        let tun_out = out.get("tun").and_then(Value::as_mapping).unwrap();
+        let hijack = tun_out
+            .get("dns-hijack")
+            .and_then(Value::as_sequence)
+            .unwrap();
+        assert_eq!(hijack[0].as_str(), Some("tcp://any:53"));
+        assert_eq!(tun_out.get("stack").and_then(Value::as_str), Some("system"));
     }
 }
