@@ -23,6 +23,24 @@ impl Logger {
 
     pub fn set_log(&self, text: String) {
         let mut logs = self.log_data.lock();
+        if let Some(last) = logs.back_mut() {
+            if *last == text {
+                *last = format!("[x2] {text}");
+                return;
+            }
+            if let Some((prefix, msg)) = last.split_once("] ") {
+                if msg == text && prefix.starts_with("[x") && prefix.ends_with(']') {
+                    let count = prefix
+                        .trim_start_matches("[x")
+                        .trim_end_matches(']')
+                        .parse::<u64>()
+                        .unwrap_or(1)
+                        + 1;
+                    *last = format!("[x{count}] {text}");
+                    return;
+                }
+            }
+        }
         if logs.len() > LOGS_QUEUE_LEN {
             logs.pop_front();
         }

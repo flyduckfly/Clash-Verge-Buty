@@ -197,6 +197,8 @@ pub struct TunDiagnosticReport {
     pub dns_nameserver: Vec<String>,
     pub dns_respect_rules: Option<bool>,
     pub dns_enhanced_mode: Option<String>,
+    pub tcp_concurrent: Option<bool>,
+    pub tcp_concurrent_warning: Option<String>,
     pub runtime_dns_source: Option<String>,
     pub final_config_path: Option<String>,
     pub config_read_error: Option<String>,
@@ -576,13 +578,9 @@ pub async fn ensure_service_ready() -> Result<()> {
     }
 }
 
-pub(super) async fn run_core_by_service(config_file: &PathBuf) -> Result<()> {
+pub(super) async fn run_core_by_service(config_file: &PathBuf, allow_reuse: bool) -> Result<()> {
     ensure_service_ready().await?;
     let status = check_service().await?;
-    if status.core_managed {
-        stop_core_by_service().await?;
-        sleep(Duration::from_secs(1)).await;
-    }
     let clash_core = Config::verge()
         .latest()
         .clash_core
@@ -596,6 +594,27 @@ pub(super) async fn run_core_by_service(config_file: &PathBuf) -> Result<()> {
     let config_dir = dirs::path_to_str(&config_dir_buf)?;
     let log_path = dirs::path_to_str(&log_path_buf)?;
     let config_file = dirs::path_to_str(config_file)?;
+    let existing = get_service_clash_state().await.ok();
+    let same_runtime = existing
+        .as_ref()
+        .and_then(|resp| resp.data.as_ref())
+        .map(|d| {
+            d.pid.is_some()
+                && d.core_type.as_deref() == Some(clash_core.as_str())
+                && d.bin_path == bin_path
+                && d.config_dir == config_dir
+                && d.log_file == log_path
+        })
+        .unwrap_or(false);
+    if allow_reuse && status.core_managed && same_runtime {
+        log::info!(target: "app", "start decision: reuse_service_core, service_process_running={}, service_core_pid={:?}, current_runtime_config={}", status.running, status.core_pid, config_file);
+        return Ok(());
+    }
+    if status.core_managed {
+        log::info!(target: "app", "start decision: restart_service_core, service_process_running={}, old_service_core_pid={:?}, current_runtime_config={}", status.running, status.core_pid, config_file);
+        stop_core_by_service().await?;
+        sleep(Duration::from_secs(1)).await;
+    }
     let file_tun_enable = read_tun_enable_from_runtime_file(config_file);
     let mut map = HashMap::new();
     map.insert("core_type", clash_core.as_str());
@@ -603,6 +622,7 @@ pub(super) async fn run_core_by_service(config_file: &PathBuf) -> Result<()> {
     map.insert("config_dir", config_dir);
     map.insert("config_file", config_file);
     map.insert("log_file", log_path);
+    log::info!(target: "app", "start decision: start_service_core");
     log::info!(target: "app", "service mode enabled: calling /start_clash");
     log::info!(target: "app", "start_clash request field summary: core_type={clash_core}, bin_path_exists={}, config_dir_exists={}, config_file={}, log_file={}, config_tun_enable={:?}", bin_path_buf.exists(), config_dir_buf.exists(), config_file, log_path, file_tun_enable);
     let res = reqwest::ClientBuilder::new()
@@ -663,6 +683,8 @@ pub(super) async fn run_core_by_service(config_file: &PathBuf) -> Result<()> {
 }
 
 pub(super) async fn stop_core_by_service() -> Result<()> {
+    let status = check_service().await.ok();
+    log::info!(target: "app", "stop_clash input: service_process_running={}, service_core_pid={:?}", status.as_ref().map(|s| s.running).unwrap_or(false), status.as_ref().and_then(|s| s.core_pid));
     let res = reqwest::ClientBuilder::new()
         .no_proxy()
         .build()?
@@ -675,6 +697,7 @@ pub(super) async fn stop_core_by_service() -> Result<()> {
     if res.code != 0 {
         bail!(res.msg);
     }
+    log::info!(target: "app", "stop_clash decision: stop_service_core");
     Ok(())
 }
 
@@ -703,11 +726,13 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
     let mut dns_nameserver = vec![];
     let mut dns_respect_rules = None;
     let mut dns_enhanced_mode = None;
+    let mut tcp_concurrent = None;
     let mut dns_fake_ip_range = None;
     let (runtime_yaml, runtime_dns_source, final_config_path, config_read_error) =
         read_runtime_config_yaml();
     if let Some(yaml) = runtime_yaml.as_ref().and_then(|v| v.as_mapping()) {
         let dns = yaml.get("dns").and_then(|v| v.as_mapping());
+        tcp_concurrent = yaml.get("tcp-concurrent").and_then(|v| v.as_bool());
         if let Some(dns) = dns {
             proxy_server_nameserver = dns
                 .get("proxy-server-nameserver")
@@ -1066,6 +1091,19 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
     {
         reasons.push("outbound failed, check service log".to_string());
     }
+    let only_one_usage_storm = service_log_summary
+        .iter()
+        .filter(|line| line.contains("Only one usage of each socket address"))
+        .count()
+        >= 5;
+    let mut tcp_concurrent_warning = None;
+    if only_one_usage_storm && tcp_concurrent == Some(true) {
+        tcp_concurrent_warning =
+            Some("当前出口节点连接风暴，tcp-concurrent 可能放大本机端口耗尽。".to_string());
+        reasons
+            .push("tcp-concurrent may amplify socket exhaustion under outbound storm".to_string());
+    }
+    log::info!(target: "app", "diagnose network runtime: tun_enable={}, tcp_concurrent={:?}, only_one_usage_storm={}", tun_enabled, tcp_concurrent, only_one_usage_storm);
 
     Ok(TunDiagnosticReport {
         tun_enabled,
@@ -1103,6 +1141,8 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
         dns_nameserver,
         dns_respect_rules,
         dns_enhanced_mode,
+        tcp_concurrent,
+        tcp_concurrent_warning,
         runtime_dns_source: Some(runtime_dns_source),
         final_config_path,
         config_read_error,
