@@ -1,9 +1,16 @@
 import useSWR from "swr";
-import { useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { IconButton, Tooltip } from "@mui/material";
 import { PrivacyTipRounded, Settings, InfoRounded } from "@mui/icons-material";
-import { checkService } from "@/services/cmds";
+import {
+  checkService,
+  getCurrentLogFilePath,
+  getDebugRecordingStatus,
+  openLogsDir,
+  startDebugRecording,
+  stopDebugRecording,
+} from "@/services/cmds";
 import { useVerge } from "@/hooks/use-verge";
 import { DialogRef, Switch } from "@/components/base";
 import { SettingList, SettingItem } from "./mods/setting-comp";
@@ -51,6 +58,18 @@ const SettingSystem = ({ onError }: Props) => {
   const onChangeData = (patch: Partial<IVergeConfig>) => {
     mutateVerge({ ...verge, ...patch }, false);
   };
+  const [debugRecording, setDebugRecording] = useState(false);
+  const [debugPath, setDebugPath] = useState("");
+  const [logPath, setLogPath] = useState("");
+  const [debugLoading, setDebugLoading] = useState(false);
+
+  useEffect(() => {
+    getDebugRecordingStatus().then((s) => {
+      setDebugRecording(!!s.recording);
+      setDebugPath(s.path || "");
+    });
+    getCurrentLogFilePath().then(setLogPath).catch(() => setLogPath("unknown"));
+  }, []);
 
   return (
     <SettingList title={t("System Setting")}>
@@ -172,6 +191,51 @@ const SettingSystem = ({ onError }: Props) => {
         >
           <Switch edge="end" />
         </GuardState>
+      </SettingItem>
+
+      <SettingItem label="Debug Recording">
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>status: {debugRecording ? "recording" : "stopped"}</div>
+          <div style={{ fontSize: 12, maxWidth: 340, textAlign: "right", wordBreak: "break-all" }}>debug: {debugPath || "-"}</div>
+          <div style={{ fontSize: 12, maxWidth: 340, textAlign: "right", wordBreak: "break-all" }}>source: {logPath || "-"}</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              disabled={debugLoading}
+              onClick={async () => {
+                setDebugLoading(true);
+                try {
+                  const r = await startDebugRecording();
+                  setDebugRecording(true);
+                  setDebugPath(r.path || "");
+                } catch (e: any) {
+                  onError?.(e);
+                } finally {
+                  setDebugLoading(false);
+                }
+              }}
+            >
+              开始记录调试日志
+            </button>
+            <button
+              disabled={debugLoading}
+              onClick={async () => {
+                setDebugLoading(true);
+                try {
+                  const r = await stopDebugRecording();
+                  setDebugRecording(false);
+                  setDebugPath(r.path || "");
+                } catch (e: any) {
+                  onError?.(e);
+                } finally {
+                  setDebugLoading(false);
+                }
+              }}
+            >
+              停止记录调试日志
+            </button>
+            <button onClick={openLogsDir}>打开日志目录</button>
+          </div>
+        </div>
       </SettingItem>
 
       <SettingItem label={t("Silent Start")}>

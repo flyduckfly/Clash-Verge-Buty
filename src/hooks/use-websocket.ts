@@ -6,6 +6,7 @@ export interface WsOptions {
   errorCount?: number; // default is 5
   retryInterval?: number; // default is 2500
   onError?: () => void;
+  onOpen?: () => void;
 }
 
 export const useWebsocket = (onMessage: WsMsgFn, options?: WsOptions) => {
@@ -34,11 +35,24 @@ export const useWebsocket = (onMessage: WsMsgFn, options?: WsOptions) => {
       wsRef.current = ws;
 
       ws.addEventListener("message", onMessage);
+      ws.addEventListener("open", () => {
+        errorCount = options?.errorCount ?? 5;
+        options?.onOpen?.();
+      });
       ws.addEventListener("error", () => {
         errorCount -= 1;
 
         if (errorCount >= 0) {
           timerRef.current = setTimeout(connectHelper, 2500);
+        } else {
+          disconnect();
+          options?.onError?.();
+        }
+      });
+      ws.addEventListener("close", () => {
+        errorCount -= 1;
+        if (errorCount >= 0) {
+          timerRef.current = setTimeout(connectHelper, options?.retryInterval ?? 2500);
         } else {
           disconnect();
           options?.onError?.();

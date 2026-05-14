@@ -234,3 +234,19 @@ export async function copyIconFile(
 export async function diagnoseTunOutbound() {
   return invoke<any>("diagnose_tun_outbound");
 }
+
+export async function startDebugRecording() {
+  return invoke<{ path?: string; started: boolean; stopped: boolean }>("start_debug_recording");
+}
+
+export async function stopDebugRecording() {
+  return invoke<{ path?: string; started: boolean; stopped: boolean }>("stop_debug_recording");
+}
+
+export async function getDebugRecordingStatus() {
+  return invoke<{ recording: boolean; path?: string }>("get_debug_recording_status");
+}
+
+export async function getCurrentLogFilePath() {
+  return invoke<string>("get_current_log_file_path");
+}
