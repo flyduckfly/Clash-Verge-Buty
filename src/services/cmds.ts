@@ -229,3 +229,8 @@ export async function copyIconFile(
 ) {
   return invoke<void>("copy_icon_file", { path, name });
 }
+
+
+export async function diagnoseTunOutbound() {
+  return invoke<any>("diagnose_tun_outbound");
+}
