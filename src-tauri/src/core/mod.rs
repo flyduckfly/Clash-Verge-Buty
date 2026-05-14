@@ -1,4 +1,5 @@
 pub mod clash_api;
+pub mod debug_recorder;
 mod core;
 pub mod handle;
 pub mod hotkey;

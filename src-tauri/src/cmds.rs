@@ -247,6 +247,36 @@ pub fn open_web_url(url: String) -> CmdResult<()> {
     wrap_err!(open::that(url))
 }
 
+#[tauri::command]
+pub fn start_debug_recording() -> CmdResult<debug_recorder::DebugRecordingResult> {
+    wrap_err!(debug_recorder::DebugRecorder::global().start())
+}
+
+#[tauri::command]
+pub fn stop_debug_recording() -> CmdResult<debug_recorder::DebugRecordingResult> {
+    Ok(debug_recorder::DebugRecorder::global().stop())
+}
+
+#[tauri::command]
+pub fn get_debug_recording_status() -> CmdResult<debug_recorder::DebugRecordingStatus> {
+    Ok(debug_recorder::DebugRecorder::global().status())
+}
+
+#[tauri::command]
+pub fn get_current_log_file_path() -> CmdResult<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let verge = Config::verge();
+        let v = verge.latest();
+        if v.enable_service_mode.unwrap_or(false) {
+            let p = wrap_err!(crate::utils::dirs::get_latest_service_log_file())?;
+            return Ok(p
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "logs/service/<none>".to_string()));
+        }
+    }
+    Ok("core-stdout-stream".to_string())
+}
 #[cfg(windows)]
 pub mod uwp {
     use super::*;

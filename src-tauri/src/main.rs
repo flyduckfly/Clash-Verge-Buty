@@ -44,6 +44,10 @@ fn main() -> std::io::Result<()> {
             // clash
             cmds::get_clash_info,
             cmds::get_clash_logs,
+            cmds::start_debug_recording,
+            cmds::stop_debug_recording,
+            cmds::get_debug_recording_status,
+            cmds::get_current_log_file_path,
             cmds::patch_clash_config,
             cmds::change_clash_core,
             cmds::get_runtime_config,
