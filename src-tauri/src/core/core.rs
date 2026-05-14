@@ -4,12 +4,12 @@ use crate::{config::*, utils::dirs};
 use anyhow::{bail, Context, Result};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::{fs, io::Write, sync::Arc, time::Duration};
 use sysinfo::{Pid, System};
 use tauri::api::process::{Command, CommandChild, CommandEvent};
 use tokio::time::sleep;
-#[cfg(target_os = "linux")]
-use std::path::Path;
 
 #[derive(Debug)]
 pub struct CoreManager {
@@ -20,6 +20,21 @@ pub struct CoreManager {
 }
 
 impl CoreManager {
+    fn read_pid_file_alive() -> Option<u32> {
+        let pid = dirs::clash_pid_path()
+            .ok()
+            .and_then(|path| fs::read(path).ok())
+            .and_then(|pid| String::from_utf8(pid).ok())
+            .and_then(|pid| pid.trim().parse::<u32>().ok())?;
+        let mut system = System::new();
+        system.refresh_all();
+        let process = system.process(Pid::from_u32(pid))?;
+        if process.name().contains("clash") {
+            return Some(pid);
+        }
+        None
+    }
+
     pub fn global() -> &'static CoreManager {
         static CORE_MANAGER: OnceCell<CoreManager> = OnceCell::new();
 
@@ -86,11 +101,13 @@ impl CoreManager {
         let config_path = Config::generate_file(ConfigType::Run)?;
         log::info!(target: "app", "starting core with runtime config: {}", dirs::path_to_str(&config_path)?);
         self.log_tun_prerequisites();
+        let previous_use_service_mode_lock = *self.use_service_mode.lock();
+        let pid_file_pid = Self::read_pid_file_alive();
 
         #[allow(unused_mut)]
         let mut should_kill = match self.sidecar.lock().take() {
             Some(child) => {
-                log::debug!(target: "app", "stop the core by sidecar");
+                log::info!(target: "app", "run_core decision: stop_sidecar");
                 let _ = child.kill();
                 true
             }
@@ -98,35 +115,45 @@ impl CoreManager {
         };
 
         #[cfg(target_os = "windows")]
-        if *self.use_service_mode.lock() {
-            log::debug!(target: "app", "stop the core by service");
-            log_err!(super::win_service::stop_core_by_service().await);
-            should_kill = true;
-        }
-
-        // 这里得等一会儿
-        if should_kill {
-            sleep(Duration::from_millis(500)).await;
-        }
-
-        #[cfg(target_os = "windows")]
         {
             use super::win_service;
 
-            // 服务模式
-            let enable = { Config::verge().latest().enable_service_mode };
-            let enable = enable.unwrap_or(false);
+            let desired_service_mode = Config::verge()
+                .latest()
+                .enable_service_mode
+                .unwrap_or(false);
+            let service_status = win_service::check_service().await?;
+            let sidecar_pid = self.sidecar.lock().as_ref().map(|child| child.pid());
+            log::info!(
+                target: "app",
+                "run_core decision input: desired_service_mode={}, previous_use_service_mode_lock={}, service_process_running={}, service_core_pid={:?}, sidecar_pid={:?}, pid_file_pid={:?}, current_runtime_config={}",
+                desired_service_mode,
+                previous_use_service_mode_lock,
+                service_status.running,
+                service_status.core_pid,
+                sidecar_pid,
+                pid_file_pid,
+                dirs::path_to_str(&config_path)?
+            );
 
-            *self.use_service_mode.lock() = enable;
+            if service_status.core_managed {
+                log::info!(target: "app", "run_core decision: stop_service_core");
+                win_service::stop_core_by_service().await?;
+                should_kill = true;
+            }
 
-            if enable {
-                // 服务模式启动失败直接报错，避免误判为服务托管
-                log::debug!(target: "app", "try to run core in service mode");
+            if should_kill {
+                sleep(Duration::from_millis(500)).await;
+            }
+
+            *self.use_service_mode.lock() = desired_service_mode;
+            if desired_service_mode {
+                log::info!(target: "app", "run_core decision: start_service_core_or_reuse");
                 let tun_enabled = Config::verge().latest().enable_tun_mode.unwrap_or(false);
 
                 match (|| async {
                     win_service::ensure_service_ready().await?;
-                    win_service::run_core_by_service(&config_path).await
+                    win_service::run_core_by_service(&config_path, true).await
                 })()
                 .await
                 {
@@ -134,12 +161,19 @@ impl CoreManager {
                     Err(err) => {
                         log::error!(target: "app", "Service Mode failed; service could not start clash core. {err}");
                         if tun_enabled {
-                            bail!("Tun mode requires a working clash-verge-service on Windows: {err}");
+                            bail!(
+                                "Tun mode requires a working clash-verge-service on Windows: {err}"
+                            );
                         }
                         bail!("Service Mode failed; service could not start clash core. {err}");
                     }
                 }
             }
+        }
+
+        // 这里得等一会儿
+        if should_kill {
+            sleep(Duration::from_millis(500)).await;
         }
 
         let app_dir = dirs::app_home_dir()?;
@@ -158,6 +192,7 @@ impl CoreManager {
         };
 
         let cmd = Command::new_sidecar(clash_core)?;
+        log::info!(target: "app", "run_core decision: start_sidecar");
         let (mut rx, cmd_child) = cmd.args(args).spawn()?;
 
         // 将pid写入文件中
@@ -217,17 +252,26 @@ impl CoreManager {
         #[cfg(target_os = "windows")]
         {
             use deelevate::{PrivilegeLevel, Token};
-            let service_mode = Config::verge().latest().enable_service_mode.unwrap_or(false);
+            let service_mode = Config::verge()
+                .latest()
+                .enable_service_mode
+                .unwrap_or(false);
             let privilege = Token::with_current_process()
                 .ok()
                 .and_then(|t| t.privilege_level().ok());
             let is_admin = matches!(privilege, Some(PrivilegeLevel::Elevated));
             if !service_mode {
                 log::error!(target: "app", "Tun mode is enabled but service mode is disabled on Windows. This usually fails without admin/wintun permissions.");
-                super::handle::Handle::emit_log("error", "[service] Tun mode is enabled but service mode is disabled on Windows.");
+                super::handle::Handle::emit_log(
+                    "error",
+                    "[service] Tun mode is enabled but service mode is disabled on Windows.",
+                );
             } else {
                 log::info!(target: "app", "Tun mode enabled on Windows with service mode.");
-                super::handle::Handle::emit_log("info", "[service] Tun mode enabled on Windows with service mode.");
+                super::handle::Handle::emit_log(
+                    "info",
+                    "[service] Tun mode enabled on Windows with service mode.",
+                );
             }
             if !is_admin {
                 log::warn!(target: "app", "Current process is not elevated. If service mode is unavailable, Tun setup may fail due to missing admin privileges/wintun route permissions.");
@@ -251,12 +295,6 @@ impl CoreManager {
 
     /// 重启内核
     pub fn recover_core(&'static self) -> Result<()> {
-        // 服务模式不管
-        #[cfg(target_os = "windows")]
-        if *self.use_service_mode.lock() {
-            return Ok(());
-        }
-
         // 清空原来的sidecar值
         if let Some(sidecar) = self.sidecar.lock().take() {
             let _ = sidecar.kill();
@@ -268,7 +306,27 @@ impl CoreManager {
             sleep(Duration::from_millis(6666)).await;
 
             if self.sidecar.lock().is_none() {
-                log::info!(target: "app", "recover clash core");
+                #[cfg(target_os = "windows")]
+                {
+                    let desired_service_mode = Config::verge()
+                        .latest()
+                        .enable_service_mode
+                        .unwrap_or(false);
+                    let previous_use_service_mode_lock = *self.use_service_mode.lock();
+                    let pid_file_pid = Self::read_pid_file_alive();
+                    let service_status = super::win_service::check_service().await.ok();
+                    let service_running =
+                        service_status.as_ref().map(|s| s.running).unwrap_or(false);
+                    let service_core_pid = service_status.as_ref().and_then(|s| s.core_pid);
+                    let sidecar_pid = self.sidecar.lock().as_ref().map(|c| c.pid());
+                    log::info!(target: "app", "recover_core decision input: reason=sidecar_terminated, desired_service_mode={}, previous_use_service_mode_lock={}, service_process_running={}, service_core_pid={:?}, sidecar_pid={:?}, pid_file_pid={:?}", desired_service_mode, previous_use_service_mode_lock, service_running, service_core_pid, sidecar_pid, pid_file_pid);
+                    if desired_service_mode || service_core_pid.is_some() {
+                        log::info!(target: "app", "recover_core decision: skip");
+                        return;
+                    }
+                }
+
+                log::info!(target: "app", "recover_core decision: start_sidecar");
 
                 // 重新启动app
                 if let Err(err) = self.run_core().await {
@@ -286,17 +344,23 @@ impl CoreManager {
     /// 停止核心运行
     pub fn stop_core(&self) -> Result<()> {
         #[cfg(target_os = "windows")]
-        if *self.use_service_mode.lock() {
-            log::debug!(target: "app", "stop the core by service");
-            tauri::async_runtime::block_on(async move {
+        tauri::async_runtime::block_on(async move {
+            let desired_service_mode = Config::verge()
+                .latest()
+                .enable_service_mode
+                .unwrap_or(false);
+            let service_status = super::win_service::check_service().await.ok();
+            let service_core_pid = service_status.as_ref().and_then(|s| s.core_pid);
+            log::info!(target: "app", "stop_core decision input: desired_service_mode={}, service_process_running={}, service_core_pid={:?}", desired_service_mode, service_status.as_ref().map(|s| s.running).unwrap_or(false), service_core_pid);
+            if service_core_pid.is_some() {
+                log::info!(target: "app", "stop_core decision: stop_service_core");
                 log_err!(super::win_service::stop_core_by_service().await);
-            });
-            return Ok(());
-        }
+            }
+        });
 
         let mut sidecar = self.sidecar.lock();
         if let Some(child) = sidecar.take() {
-            log::debug!(target: "app", "stop the core by sidecar");
+            log::info!(target: "app", "stop_core decision: stop_sidecar");
             let _ = child.kill();
         }
         Ok(())
