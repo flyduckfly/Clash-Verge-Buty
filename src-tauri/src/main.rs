@@ -76,6 +76,7 @@ fn main() -> std::io::Result<()> {
             cmds::service::check_service,
             cmds::service::install_service,
             cmds::service::uninstall_service,
+            cmds::service::diagnose_tun_outbound,
             // clash api
             cmds::clash_api_get_proxy_delay
         ]);
