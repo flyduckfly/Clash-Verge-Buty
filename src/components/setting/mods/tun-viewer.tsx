@@ -21,7 +21,7 @@ import { diagnoseTunOutbound } from "@/services/cmds";
 
 interface TunDiagResult {
   system_dns_status?: "not_tested" | "failed" | "fake-ip" | "resolved" | "mixed";
-  dns_proxy_server_nameserver_status?: "configured" | "implicit_fallback" | "unknown" | "failed";
+  dns_proxy_server_nameserver_status?: "configured" | "implicit_fallback" | "runtime_injected" | "unknown" | "failed";
   reasons?: string[];
   tun_enabled?: boolean;
   service_core_managed?: boolean;

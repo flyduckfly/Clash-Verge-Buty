@@ -699,6 +699,16 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
 
     let dns_proxy_server_nameserver_status = if !proxy_server_host_is_domain {
         Some("unknown".to_string())
+    } else if tun_enabled
+        && dns_hijack_ok
+        && dns_enhanced_mode.as_deref() == Some("fake-ip")
+        && proxy_server_nameserver
+            == vec![
+                "https://223.5.5.5/dns-query".to_string(),
+                "https://223.6.6.6/dns-query".to_string(),
+            ]
+    {
+        Some("runtime_injected".to_string())
     } else if proxy_server_nameserver.is_empty() {
         Some("implicit_fallback".to_string())
     } else {
@@ -736,10 +746,10 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
         adapter_candidates,
         mode,
         outbound_group,
-        selected_proxy,
-        selected_proxy_type,
-        route_decision: selected_proxy.clone(),
-        route_decision_type: selected_proxy_type.clone(),
+        selected_proxy: selected_proxy.clone(),
+        selected_proxy_type: selected_proxy_type.clone(),
+        route_decision: selected_proxy,
+        route_decision_type: selected_proxy_type,
         selected_proxy_server_host,
         selected_proxy_server_port,
         selected_proxy_is_direct,
