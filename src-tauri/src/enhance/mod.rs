@@ -10,9 +10,10 @@ use self::merge::*;
 use self::script::*;
 use self::tun::*;
 use crate::config::Config;
-use serde_yaml::Mapping;
+use serde_yaml::{Mapping, Value};
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 type ResultLog = Vec<(String, String)>;
 
@@ -115,10 +116,193 @@ pub fn enhance() -> (Mapping, Vec<String>, HashMap<String, ResultLog>) {
 
     config = use_tun(config, enable_tun, source_has_tun, clash_tun_default);
     config = use_sort(config);
+    config = apply_external_merge_rule(config);
 
     let mut exists_set = HashSet::new();
     exists_set.extend(exists_keys.into_iter());
     exists_keys = exists_set.into_iter().collect();
 
     (config, exists_keys, result_map)
+}
+
+fn external_merge_rule_path_from(exe_path: &Path) -> Option<PathBuf> {
+    exe_path.parent().map(|dir| dir.join("merge-rule.yaml"))
+}
+
+fn external_merge_rule_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| external_merge_rule_path_from(&exe))
+}
+
+fn load_external_merge_rule(path: &Path) -> Option<Mapping> {
+    if !path.exists() {
+        return None;
+    }
+
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => {
+            log::warn!(target: "app", "Failed to read external merge-rule.yaml ({}): {}", path.display(), err);
+            return None;
+        }
+    };
+
+    if content.trim().is_empty() {
+        log::warn!(target: "app", "External merge-rule.yaml is empty: {}", path.display());
+        return None;
+    }
+
+    match serde_yaml::from_str::<Value>(&content) {
+        Ok(Value::Mapping(mapping)) => Some(mapping),
+        Ok(_) => {
+            log::warn!(target: "app", "External merge-rule.yaml root is not a mapping: {}", path.display());
+            None
+        }
+        Err(err) => {
+            log::warn!(target: "app", "Failed to parse external merge-rule.yaml ({}): {}", path.display(), err);
+            None
+        }
+    }
+}
+
+fn deep_merge_mapping(mut base: Mapping, overlay: Mapping) -> Mapping {
+    for (key, overlay_val) in overlay {
+        let merged_val = match (base.remove(&key), overlay_val) {
+            (Some(Value::Mapping(base_map)), Value::Mapping(overlay_map)) => {
+                Value::Mapping(deep_merge_mapping(base_map, overlay_map))
+            }
+            (_, value) => value,
+        };
+        base.insert(key, merged_val);
+    }
+    base
+}
+
+fn apply_external_merge_rule(config: Mapping) -> Mapping {
+    let Some(path) = external_merge_rule_path() else {
+        return config;
+    };
+    let Some(merge_rule) = load_external_merge_rule(&path) else {
+        return config;
+    };
+
+    let merged = deep_merge_mapping(config, merge_rule);
+    log::info!(target: "app", "Applied external merge-rule.yaml: {}", path.display());
+    merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn yaml_mapping(input: &str) -> Mapping {
+        serde_yaml::from_str::<Mapping>(input).unwrap()
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cvb-merge-rule-test-{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn deep_merge_nested_mapping_and_keep_existing_fields() {
+        let base = yaml_mapping(
+            r#"
+dns:
+  ipv6: true
+  enhanced-mode: fake-ip
+tun:
+  enable: true
+  dns-hijack:
+    - any:53
+"#,
+        );
+        let overlay = yaml_mapping(
+            r#"
+ipv6: false
+dns:
+  ipv6: false
+tun:
+  route-exclude-address:
+    - 223.5.5.5/32
+    - 223.6.6.6/32
+"#,
+        );
+
+        let merged = deep_merge_mapping(base, overlay);
+        assert_eq!(merged.get("ipv6").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            merged
+                .get("dns")
+                .and_then(Value::as_mapping)
+                .and_then(|dns| dns.get("ipv6"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            merged
+                .get("dns")
+                .and_then(Value::as_mapping)
+                .and_then(|dns| dns.get("enhanced-mode"))
+                .and_then(Value::as_str),
+            Some("fake-ip")
+        );
+        assert_eq!(
+            merged
+                .get("tun")
+                .and_then(Value::as_mapping)
+                .and_then(|tun| tun.get("enable"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn sequence_should_be_overridden() {
+        let base = yaml_mapping("rules: [A, B]");
+        let overlay = yaml_mapping("rules: [C]");
+        let merged = deep_merge_mapping(base, overlay);
+        let rules = merged.get("rules").and_then(Value::as_sequence).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].as_str(), Some("C"));
+    }
+
+    #[test]
+    fn load_external_merge_rule_handles_missing_invalid_and_non_mapping() {
+        let dir = unique_temp_dir();
+        let path = dir.join("merge-rule.yaml");
+        assert!(load_external_merge_rule(&path).is_none());
+
+        std::fs::write(&path, ":\ninvalid").unwrap();
+        assert!(load_external_merge_rule(&path).is_none());
+
+        std::fs::write(&path, "- not\n- mapping").unwrap();
+        assert!(load_external_merge_rule(&path).is_none());
+    }
+
+    #[test]
+    fn load_external_merge_rule_valid_mapping() {
+        let dir = unique_temp_dir();
+        let path = dir.join("merge-rule.yaml");
+        std::fs::write(&path, "ipv6: false\ndns:\n  ipv6: false\n").unwrap();
+        let loaded = load_external_merge_rule(&path).unwrap();
+        assert_eq!(loaded.get("ipv6").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn resolve_windows_portable_style_path_from_exe_parent() {
+        let exe = PathBuf::from(r"C:\UserProgram\Clash.Verge.Buty.Portable\Clash-Verge-Buty.exe");
+        let path = external_merge_rule_path_from(&exe).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from(r"C:\UserProgram\Clash.Verge.Buty.Portable\merge-rule.yaml")
+        );
+    }
 }
