@@ -12,7 +12,7 @@ use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::{env::current_exe, process::Command as StdCommand};
-use tokio::time::sleep;
+use tokio::{net::lookup_host, time::{sleep, timeout}};
 
 const SERVICE_URL: &str = "http://127.0.0.1:33211";
 const EXTERNAL_CONTROLLER_URL: &str = "http://127.0.0.1:9097/configs";
@@ -157,11 +157,58 @@ pub struct TunDiagnosticReport {
     pub mode: Option<String>,
     pub outbound_group: Option<String>,
     pub selected_proxy: Option<String>,
+    pub selected_proxy_type: Option<String>,
+    pub selected_proxy_server_host: Option<String>,
+    pub selected_proxy_server_port: Option<u16>,
     pub selected_proxy_delay: Option<i64>,
     pub selected_proxy_reachable: Option<bool>,
+    pub selected_proxy_delay_error: Option<String>,
+    pub proxy_dns_failed: bool,
+    pub proxy_dns_failed_hosts: Vec<String>,
+    pub proxy_dns_failed_targets: Vec<String>,
+    pub proxy_dns_failure_hint: Option<String>,
+    pub system_dns_resolved_hosts: Vec<SystemDnsResolvedHost>,
+    pub proxy_server_nameserver: Vec<String>,
+    pub dns_nameserver: Vec<String>,
+    pub dns_respect_rules: Option<bool>,
+    pub dns_enhanced_mode: Option<String>,
     pub service_log_file: Option<String>,
     pub service_log_summary: Vec<String>,
     pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SystemDnsResolvedHost {
+    pub host: String,
+    pub ips: Vec<String>,
+}
+
+fn collect_string_array(v: Option<&JsonValue>) -> Vec<String> {
+    v.and_then(|x| x.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str()).map(|x| x.to_string()).collect())
+        .unwrap_or_default()
+}
+
+fn extract_proxy_dns_failures(line: &str) -> Option<(String, Option<String>)> {
+    let marker = "connect error: dns resolve failed: couldn't find ip";
+    let lower = line.to_lowercase();
+    let pos = lower.find(marker)?;
+    let target = line[..pos]
+        .split_whitespace()
+        .last()
+        .unwrap_or_default()
+        .trim_matches(|c: char| ",;()".contains(c))
+        .to_string();
+    if target.is_empty() {
+        return None;
+    }
+    let host = target
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(target.as_str())
+        .trim_matches(|c: char| "[]".contains(c))
+        .to_string();
+    Some((target, if host.is_empty() { None } else { Some(host) }))
 }
 
 async fn get_service_health() -> Result<HealthResponse> {
@@ -410,6 +457,10 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
     let mut tun_enabled = false;
     let mut dns_hijack_ok = false;
     let mut mode = None;
+    let mut proxy_server_nameserver = vec![];
+    let mut dns_nameserver = vec![];
+    let mut dns_respect_rules = None;
+    let mut dns_enhanced_mode = None;
     if let Ok(resp) = cfg_resp {
         if let Ok(v) = resp.json::<JsonValue>().await {
             mode = v.get("mode").and_then(|m| m.as_str()).map(|s| s.to_string());
@@ -420,6 +471,12 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
                     .and_then(|d| d.as_array())
                     .map(|arr| arr.iter().any(|x| x.as_str().unwrap_or("").contains(":53")))
                     .unwrap_or(false);
+            }
+            if let Some(dns) = v.get("dns") {
+                proxy_server_nameserver = collect_string_array(dns.get("proxy-server-nameserver"));
+                dns_nameserver = collect_string_array(dns.get("nameserver"));
+                dns_respect_rules = dns.get("respect-rules").and_then(|x| x.as_bool());
+                dns_enhanced_mode = dns.get("enhanced-mode").and_then(|x| x.as_str()).map(|x| x.to_string());
             }
         }
     }
@@ -445,8 +502,12 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
 
     let mut outbound_group = None;
     let mut selected_proxy = None;
+    let mut selected_proxy_type = None;
+    let mut selected_proxy_server_host = None;
+    let mut selected_proxy_server_port = None;
     let mut selected_proxy_delay = None;
     let mut selected_proxy_reachable = None;
+    let mut selected_proxy_delay_error = None;
     if core_api_ready {
         if let Ok(resp) = client.get("http://127.0.0.1:9097/proxies").send().await {
             if let Ok(v) = resp.json::<JsonValue>().await {
@@ -456,6 +517,13 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
                         outbound_group = Some(group_name.to_string());
                         selected_proxy = Some(now.to_string());
                         break;
+                    }
+                }
+                if let Some(proxy_name) = selected_proxy.as_deref() {
+                    if let Some(node) = proxies.get(proxy_name) {
+                        selected_proxy_type = node.get("type").and_then(|x| x.as_str()).map(|x| x.to_string());
+                        selected_proxy_server_host = node.get("server").and_then(|x| x.as_str()).map(|x| x.to_string());
+                        selected_proxy_server_port = node.get("port").and_then(|x| x.as_u64()).map(|x| x as u16);
                     }
                 }
             }
@@ -469,7 +537,12 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
                 if let Ok(v) = resp.json::<JsonValue>().await {
                     selected_proxy_delay = v.get("delay").and_then(|d| d.as_i64());
                     selected_proxy_reachable = selected_proxy_delay.map(|d| d > 0 && d < 8000);
+                    if selected_proxy_delay.is_none() {
+                        selected_proxy_delay_error = v.get("error").and_then(|e| e.as_str()).map(|e| e.to_string()).or_else(|| Some(v.to_string()));
+                    }
                 }
+            } else {
+                selected_proxy_delay_error = Some("delay request failed".to_string());
             }
             if selected_proxy_reachable == Some(false) {
                 reasons.push("TUN is enabled, but selected proxy is not reachable.".to_string());
@@ -483,6 +556,9 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
         .and_then(|s| s.data.as_ref())
         .map(|d| d.log_file.clone());
     let mut service_log_summary = vec![];
+    let mut proxy_dns_failed = false;
+    let mut proxy_dns_failed_hosts: Vec<String> = vec![];
+    let mut proxy_dns_failed_targets: Vec<String> = vec![];
     if let Some(path) = service_log_file.clone() {
         if let Ok(content) = std::fs::read_to_string(&path) {
             let keys = ["dial", "proxy", "timeout", "connect", "refused", "handshake", "route", "dns", "tun", "failed"];
@@ -491,10 +567,58 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
                 let l = line.to_lowercase();
                 if keys.iter().any(|k| l.contains(k)) {
                     let sanitized = line.replace("token=", "token=***");
+                    if let Some((target, host)) = extract_proxy_dns_failures(&sanitized) {
+                        proxy_dns_failed = true;
+                        proxy_dns_failed_targets.push(target);
+                        if let Some(host) = host {
+                            proxy_dns_failed_hosts.push(host);
+                        }
+                    }
                     service_log_summary.push(sanitized);
                 }
             }
         }
+    }
+
+    if let Some(err) = selected_proxy_delay_error.as_deref() {
+        if err.to_lowercase().contains("dns resolve failed") {
+            proxy_dns_failed = true;
+        }
+    }
+    if proxy_dns_failed {
+        if let Some(host) = selected_proxy_server_host.clone() {
+            if !proxy_dns_failed_hosts.iter().any(|h| h == &host) {
+                proxy_dns_failed_hosts.push(host);
+            }
+        }
+    }
+    proxy_dns_failed_hosts.sort();
+    proxy_dns_failed_hosts.dedup();
+    proxy_dns_failed_targets.sort();
+    proxy_dns_failed_targets.dedup();
+
+    let mut system_dns_resolved_hosts = vec![];
+    if proxy_dns_failed {
+        for host in proxy_dns_failed_hosts.iter().take(3) {
+            if let Ok(Ok(iter)) = timeout(Duration::from_secs(2), lookup_host((host.as_str(), 0))).await {
+                let mut ips: Vec<String> = iter.map(|addr| addr.ip().to_string()).collect();
+                ips.sort();
+                ips.dedup();
+                if !ips.is_empty() {
+                    system_dns_resolved_hosts.push(SystemDnsResolvedHost { host: host.clone(), ips });
+                }
+            }
+        }
+    }
+
+    let mut proxy_dns_failure_hint = None;
+    if proxy_dns_failed {
+        reasons.push("selected proxy DNS failed".to_string());
+        proxy_dns_failure_hint = Some(if system_dns_resolved_hosts.is_empty() {
+            "当前选中代理节点的服务器域名在 Mihomo 内部解析失败，但这不一定代表域名本身失效。请检查 proxy-server-nameserver、respect-rules、DNS 出站路径或 TUN 回环。".to_string()
+        } else {
+            "系统 DNS 可以解析该代理服务器域名，但 Mihomo 内部 DNS 解析失败。请检查 proxy-server-nameserver、respect-rules、DNS 出站路径或 TUN 回环。".to_string()
+        });
     }
 
     if tun_enabled && dns_hijack_ok && route_injected && selected_proxy_reachable != Some(true) && !reasons.iter().any(|r| r.contains("selected proxy")) {
@@ -512,8 +636,21 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
         mode,
         outbound_group,
         selected_proxy,
+        selected_proxy_type,
+        selected_proxy_server_host,
+        selected_proxy_server_port,
         selected_proxy_delay,
         selected_proxy_reachable,
+        selected_proxy_delay_error,
+        proxy_dns_failed,
+        proxy_dns_failed_hosts,
+        proxy_dns_failed_targets,
+        proxy_dns_failure_hint,
+        system_dns_resolved_hosts,
+        proxy_server_nameserver,
+        dns_nameserver,
+        dns_respect_rules,
+        dns_enhanced_mode,
         service_log_file,
         service_log_summary,
         reasons,
