@@ -136,18 +136,12 @@ impl CoreManager {
                 dirs::path_to_str(&config_path)?
             );
 
-            if service_status.core_managed {
-                log::info!(target: "app", "run_core decision: stop_service_core");
-                win_service::stop_core_by_service().await?;
-                should_kill = true;
-            }
-
-            if should_kill {
-                sleep(Duration::from_millis(500)).await;
-            }
-
-            *self.use_service_mode.lock() = desired_service_mode;
             if desired_service_mode {
+                log::info!(target: "app", "run_core decision: keep_service_core_for_reuse");
+                if should_kill {
+                    sleep(Duration::from_millis(500)).await;
+                }
+                *self.use_service_mode.lock() = true;
                 log::info!(target: "app", "run_core decision: start_service_core_or_reuse");
                 let tun_enabled = Config::verge().latest().enable_tun_mode.unwrap_or(false);
 
@@ -169,6 +163,14 @@ impl CoreManager {
                     }
                 }
             }
+
+            if service_status.core_managed {
+                log::info!(target: "app", "run_core decision: stop_service_core_for_sidecar");
+                win_service::stop_core_by_service().await?;
+                should_kill = true;
+            }
+            *self.use_service_mode.lock() = false;
+            log::info!(target: "app", "run_core decision: start_sidecar");
         }
 
         // 这里得等一会儿

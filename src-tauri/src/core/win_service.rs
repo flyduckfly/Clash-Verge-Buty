@@ -10,7 +10,7 @@ use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{env::current_exe, process::Command as StdCommand};
 use tokio::{
@@ -102,7 +102,24 @@ pub struct ResponseBody {
     pub running: Option<bool>,
     pub bin_path: String,
     pub config_dir: String,
+    pub config_file: Option<String>,
     pub log_file: String,
+}
+
+fn same_windows_path(a: &str, b: &str) -> bool {
+    fn normalize(path: &str) -> String {
+        path.replace('/', "\\").to_ascii_lowercase()
+    }
+    let canonicalized = |p: &str| {
+        std::fs::canonicalize(Path::new(p))
+            .ok()
+            .map(|c| normalize(&c.to_string_lossy()))
+    };
+
+    match (canonicalized(a), canonicalized(b)) {
+        (Some(left), Some(right)) => left == right,
+        _ => normalize(a) == normalize(b),
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -595,23 +612,63 @@ pub(super) async fn run_core_by_service(config_file: &PathBuf, allow_reuse: bool
     let log_path = dirs::path_to_str(&log_path_buf)?;
     let config_file = dirs::path_to_str(config_file)?;
     let existing = get_service_clash_state().await.ok();
-    let same_runtime = existing
+    let compare = existing
         .as_ref()
         .and_then(|resp| resp.data.as_ref())
         .map(|d| {
-            d.pid.is_some()
-                && d.core_type.as_deref() == Some(clash_core.as_str())
-                && d.bin_path == bin_path
-                && d.config_dir == config_dir
-                && d.log_file == log_path
+            let compare_core_type = d.core_type.as_deref() == Some(clash_core.as_str());
+            let compare_bin_path = same_windows_path(&d.bin_path, bin_path);
+            let compare_config_dir = same_windows_path(&d.config_dir, config_dir);
+            let compare_config_file = d
+                .config_file
+                .as_deref()
+                .map(|existing_config_file| same_windows_path(existing_config_file, config_file))
+                .unwrap_or(false);
+            let compare_config_file_reason = if d.config_file.is_none() {
+                "config_file_missing"
+            } else {
+                "ok"
+            };
+            let same_runtime = d.pid.is_some()
+                && compare_core_type
+                && compare_bin_path
+                && compare_config_dir
+                && compare_config_file;
+            (
+                same_runtime,
+                compare_core_type,
+                compare_bin_path,
+                compare_config_dir,
+                compare_config_file,
+                compare_config_file_reason,
+            )
         })
-        .unwrap_or(false);
+        .unwrap_or((false, false, false, false, false, "no_existing_state"));
+    let (
+        same_runtime,
+        compare_core_type,
+        compare_bin_path,
+        compare_config_dir,
+        compare_config_file,
+        compare_config_file_reason,
+    ) = compare;
+    log::info!(
+        target: "app",
+        "run_core_by_service decision input: allow_reuse={}, same_runtime={}, compare_core_type={}, compare_bin_path={}, compare_config_dir={}, compare_config_file={}, compare_config_file_reason={}, ignored_log_file_for_reuse=true",
+        allow_reuse,
+        same_runtime,
+        compare_core_type,
+        compare_bin_path,
+        compare_config_dir,
+        compare_config_file,
+        compare_config_file_reason
+    );
     if allow_reuse && status.core_managed && same_runtime {
-        log::info!(target: "app", "start decision: reuse_service_core, service_process_running={}, service_core_pid={:?}, current_runtime_config={}", status.running, status.core_pid, config_file);
+        log::info!(target: "app", "run_core_by_service decision: reuse_service_core, service_process_running={}, service_core_pid={:?}, current_runtime_config={}", status.running, status.core_pid, config_file);
         return Ok(());
     }
     if status.core_managed {
-        log::info!(target: "app", "start decision: restart_service_core, service_process_running={}, old_service_core_pid={:?}, current_runtime_config={}", status.running, status.core_pid, config_file);
+        log::info!(target: "app", "run_core_by_service decision: restart_service_core, service_process_running={}, old_service_core_pid={:?}, current_runtime_config={}", status.running, status.core_pid, config_file);
         stop_core_by_service().await?;
         sleep(Duration::from_secs(1)).await;
     }
@@ -622,7 +679,7 @@ pub(super) async fn run_core_by_service(config_file: &PathBuf, allow_reuse: bool
     map.insert("config_dir", config_dir);
     map.insert("config_file", config_file);
     map.insert("log_file", log_path);
-    log::info!(target: "app", "start decision: start_service_core");
+    log::info!(target: "app", "run_core_by_service decision: start_service_core");
     log::info!(target: "app", "service mode enabled: calling /start_clash");
     log::info!(target: "app", "start_clash request field summary: core_type={clash_core}, bin_path_exists={}, config_dir_exists={}, config_file={}, log_file={}, config_tun_enable={:?}", bin_path_buf.exists(), config_dir_buf.exists(), config_file, log_path, file_tun_enable);
     let res = reqwest::ClientBuilder::new()
