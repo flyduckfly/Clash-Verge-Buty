@@ -34,6 +34,10 @@ interface TunDiagResult {
   selected_proxy_type?: string;
   route_decision?: string;
   route_decision_type?: string;
+  route_decision_for_test_target?: string;
+  selected_node_group?: string;
+  proxy_group_now?: string;
+  route_chain?: string[];
   selected_proxy_server_host?: string;
   selected_proxy_server_port?: number;
   selected_proxy_is_direct?: boolean;
@@ -49,6 +53,9 @@ interface TunDiagResult {
   dns_nameserver?: string[];
   dns_respect_rules?: boolean | null;
   dns_enhanced_mode?: string | null;
+  runtime_dns_source?: "runtime_config" | "runtime_file" | "mihomo_api" | "unknown";
+  final_config_path?: string;
+  config_read_error?: string;
   multiple_tun_adapters_detected?: boolean;
   adapter_candidates?: string[];
   service_log_file?: string;
@@ -341,9 +348,12 @@ export const TunViewer = forwardRef<DialogRef>((props, ref) => {
           <Typography variant="body2">
             当前模式: {diagResult?.mode === "rule" ? "规则" : diagResult?.mode === "global" ? "全局" : diagResult?.mode === "direct" ? "直连" : diagResult?.mode || "-"}
           </Typography>
-          <Typography variant="body2">
-            测试目标路由结果: {diagResult?.route_decision || diagResult?.selected_proxy || "-"}
-          </Typography>
+          <Typography variant="body2">代理组选择状态: {diagResult?.proxy_group_now || "-"}</Typography>
+          <Typography variant="body2">外网测试目标真实路由结果: {diagResult?.route_decision_for_test_target || "unknown"}</Typography>
+          {!!diagResult?.route_chain?.length && <Typography variant="body2">route chain: {diagResult.route_chain.join(" -> ")}</Typography>}
+          {diagResult?.route_decision_for_test_target === "unknown" && (
+            <Typography variant="body2" color="warning.main">当前诊断未确认真实规则命中，仅展示代理组选择状态。</Typography>
+          )}
           <Typography variant="body2">
             路由结果类型: {diagResult?.route_decision_type || diagResult?.selected_proxy_type || "-"}
           </Typography>
@@ -385,6 +395,9 @@ export const TunViewer = forwardRef<DialogRef>((props, ref) => {
           <Typography variant="body2" sx={{ wordBreak: "break-all" }}>
             nameserver: {(diagResult?.dns_nameserver || []).join(" | ") || "-"}
           </Typography>
+          <Typography variant="body2">runtime_dns_source: {diagResult?.runtime_dns_source || "-"}</Typography>
+          <Typography variant="body2" sx={{ wordBreak: "break-all" }}>final_config_path: {diagResult?.final_config_path || "-"}</Typography>
+          <Typography variant="body2" sx={{ wordBreak: "break-all" }}>config_read_error: {diagResult?.config_read_error || "-"}</Typography>
           <Typography variant="body2">respect-rules: {String(diagResult?.dns_respect_rules)}</Typography>
           <Typography variant="body2">enhanced-mode: {diagResult?.dns_enhanced_mode || "-"}</Typography>
           <Typography variant="body2">fake-ip-range: {diagResult?.dns_fake_ip_range || "-"}</Typography>
