@@ -20,6 +20,8 @@ import { StackModeSwitch } from "./stack-mode-switch";
 import { diagnoseTunOutbound } from "@/services/cmds";
 
 interface TunDiagResult {
+  system_dns_status?: "not_tested" | "failed" | "fake-ip" | "resolved" | "mixed";
+  dns_proxy_server_nameserver_status?: "configured" | "implicit_fallback" | "runtime_injected" | "unknown" | "failed";
   reasons?: string[];
   tun_enabled?: boolean;
   service_core_managed?: boolean;
@@ -27,17 +29,22 @@ interface TunDiagResult {
   dns_hijack_ok?: boolean;
   route_injected?: boolean;
   mode?: string;
+  outbound_group?: string;
   selected_proxy?: string;
   selected_proxy_type?: string;
+  route_decision?: string;
+  route_decision_type?: string;
   selected_proxy_server_host?: string;
   selected_proxy_server_port?: number;
+  selected_proxy_is_direct?: boolean;
   selected_proxy_reachable?: boolean;
   selected_proxy_delay_error?: string;
   proxy_dns_failed?: boolean;
   proxy_dns_failed_hosts?: string[];
   proxy_dns_failed_targets?: string[];
   proxy_dns_failure_hint?: string;
-  system_dns_resolved_hosts?: Array<{ host: string; ips: string[] }>;
+  system_dns_resolved_hosts?: Array<{ host: string; ips: string[]; fake_ip_flags?: boolean[] }>;
+  dns_fake_ip_range?: string | null;
   proxy_server_nameserver?: string[];
   dns_nameserver?: string[];
   dns_respect_rules?: boolean | null;
@@ -125,7 +132,7 @@ export const TunViewer = forwardRef<DialogRef>((props, ref) => {
   });
 
   const reasons = diagResult?.reasons || [];
-  const hasProxyUnavailable = reasons.some((r) =>
+  const hasProxyUnavailable = !diagResult?.selected_proxy_is_direct && reasons.some((r) =>
     r.toLowerCase().includes("selected proxy")
   );
   const hasMultiAdapter = reasons.some((r) =>
@@ -332,10 +339,19 @@ export const TunViewer = forwardRef<DialogRef>((props, ref) => {
             Route injected: {String(diagResult?.route_injected)}
           </Typography>
           <Typography variant="body2">
-            Selected proxy: {diagResult?.selected_proxy || "-"}
+            当前模式: {diagResult?.mode === "rule" ? "规则" : diagResult?.mode === "global" ? "全局" : diagResult?.mode === "direct" ? "直连" : diagResult?.mode || "-"}
           </Typography>
           <Typography variant="body2">
-            Selected proxy type: {diagResult?.selected_proxy_type || "-"}
+            测试目标路由结果: {diagResult?.route_decision || diagResult?.selected_proxy || "-"}
+          </Typography>
+          <Typography variant="body2">
+            路由结果类型: {diagResult?.route_decision_type || diagResult?.selected_proxy_type || "-"}
+          </Typography>
+          <Typography variant="body2">
+            Proxy group: {diagResult?.outbound_group || "-"}
+          </Typography>
+          <Typography variant="body2">
+            Selected node in group: {diagResult?.selected_proxy || "-"}
           </Typography>
           <Typography variant="body2">
             Selected proxy host: {diagResult?.selected_proxy_server_host || "-"}
@@ -346,6 +362,9 @@ export const TunViewer = forwardRef<DialogRef>((props, ref) => {
           <Typography variant="body2">
             Selected proxy reachable:{" "}
             {String(diagResult?.selected_proxy_reachable)}
+          </Typography>
+          <Typography variant="body2">
+            Selected proxy is DIRECT: {String(diagResult?.selected_proxy_is_direct)}
           </Typography>
           <Typography variant="body2" sx={{ wordBreak: "break-all" }}>
             Selected proxy delay error: {diagResult?.selected_proxy_delay_error || "-"}
@@ -368,8 +387,18 @@ export const TunViewer = forwardRef<DialogRef>((props, ref) => {
           </Typography>
           <Typography variant="body2">respect-rules: {String(diagResult?.dns_respect_rules)}</Typography>
           <Typography variant="body2">enhanced-mode: {diagResult?.dns_enhanced_mode || "-"}</Typography>
+          <Typography variant="body2">fake-ip-range: {diagResult?.dns_fake_ip_range || "-"}</Typography>
+          <Typography variant="body2">proxy-server-nameserver status: {diagResult?.dns_proxy_server_nameserver_status || "-"}</Typography>
+          <Typography variant="body2">system DNS status: {diagResult?.system_dns_status || "-"}</Typography>
+          <Typography variant="body2" color="text.secondary">
+            {diagResult?.system_dns_status === "fake-ip" && "fake-ip：系统 DNS 返回的是 TUN/DNS hijack/fake-ip 结果，不能作为代理节点真实解析结果。"}
+            {diagResult?.system_dns_status === "mixed" && "mixed：同时存在 fake-ip 与真实 IP，不能简单按 resolved 处理。"}
+            {diagResult?.system_dns_status === "resolved" && "resolved：仅检测到真实非 fake-ip IP。"}
+            {diagResult?.system_dns_status === "failed" && "failed：系统 DNS 无解析结果或解析失败。"}
+            {diagResult?.system_dns_status === "not_tested" && "not_tested：当前诊断未触发系统 DNS 检测。"}
+          </Typography>
           <Typography variant="body2" sx={{ wordBreak: "break-all" }}>
-            System DNS resolved hosts: {(diagResult?.system_dns_resolved_hosts || []).map((item) => `${item.host} => ${item.ips.join(",")}`).join(" | ") || "-"}
+            System DNS resolved hosts: {(diagResult?.system_dns_resolved_hosts || []).map((item) => `${item.host} => ${item.ips.map((ip, idx) => `${ip}${item.fake_ip_flags?.[idx] ? "(fake-ip)" : ""}`).join(",")}`).join(" | ") || "-"}
           </Typography>
 
           <Divider />
@@ -394,9 +423,19 @@ export const TunViewer = forwardRef<DialogRef>((props, ref) => {
               TUN 已启用，但当前选中代理节点不可用，请切换节点或检查代理组选择。
             </Typography>
           )}
+          {diagResult?.mode === "rule" && diagResult?.selected_proxy_is_direct && (
+            <Typography variant="body2" color="warning.main">
+              当前为规则模式，该测试目标的路由结果为 DIRECT。这不代表代理组当前节点是 DIRECT。
+            </Typography>
+          )}
+          {diagResult?.selected_proxy_is_direct && (
+            <Typography variant="body2" color="warning.main">
+              DIRECT 是路由决策结果，不是代理节点，因此跳过节点延迟测试。代理节点 server 域名请单独通过 Mihomo 内部 DNS 诊断。
+            </Typography>
+          )}
           {hasProxyDnsFailure && (
             <Typography variant="body2" color="warning.main">
-              {diagResult?.proxy_dns_failure_hint || "系统 DNS 可以解析该代理服务器域名，但 Mihomo 内部 DNS 解析失败。建议检查 proxy-server-nameserver、respect-rules、DNS 出站路径，或尝试切换节点。"}
+              {diagResult?.proxy_dns_failure_hint || "代理节点域名应通过 Mihomo 内部 DNS 路径验证。请检查 proxy-server-nameserver、nameserver、fake-ip-filter、respect-rules 与 DNS 出站路径。"}
             </Typography>
           )}
           {hasMultiAdapter && (
