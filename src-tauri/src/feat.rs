@@ -195,9 +195,10 @@ pub async fn patch_verge(patch: IVerge) -> Result<()> {
         #[cfg(target_os = "windows")]
         {
             let service_mode = patch.enable_service_mode;
+            let latest_service_enabled = Config::verge().latest().enable_service_mode.unwrap_or(false);
+            let service_effective_enabled = service_mode.unwrap_or(latest_service_enabled);
             if let Some(true) = tun_mode {
-                let service_enabled = Config::verge().latest().enable_service_mode.unwrap_or(false);
-                if !service_enabled && service_mode != Some(true) {
+                if !service_effective_enabled {
                     bail!("Tun mode on Windows requires Service Mode. Please enable Service Mode first.");
                 }
 
@@ -212,7 +213,15 @@ pub async fn patch_verge(patch: IVerge) -> Result<()> {
                 Config::generate()?;
                 CoreManager::global().run_core().await?;
             } else if tun_mode.is_some() {
-                update_core_config().await?;
+                // Tun 栈切换（尤其 service mode）经常需要完整重启核心，否则可能出现
+                // runtime / ui 状态不一致，且 core 在 reload 后崩溃触发 recover。
+                if service_effective_enabled {
+                    log::info!(target: "app", "tun mode changed under Windows service mode, restarting core instead of hot reload");
+                    Config::generate()?;
+                    CoreManager::global().run_core().await?;
+                } else {
+                    update_core_config().await?;
+                }
             }
         }
 
