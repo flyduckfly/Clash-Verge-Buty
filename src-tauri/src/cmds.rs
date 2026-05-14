@@ -343,6 +343,11 @@ pub mod service {
     pub async fn uninstall_service() -> CmdResult {
         wrap_err!(win_service::uninstall_service().await)
     }
+
+    #[tauri::command]
+    pub async fn diagnose_tun_outbound() -> CmdResult<win_service::TunDiagnosticReport> {
+        wrap_err!(win_service::diagnose_tun_outbound().await)
+    }
 }
 
 #[cfg(not(windows))]
@@ -359,6 +364,11 @@ pub mod service {
     }
     #[tauri::command]
     pub async fn uninstall_service() -> CmdResult {
+        Ok(())
+    }
+
+    #[tauri::command]
+    pub async fn diagnose_tun_outbound() -> CmdResult {
         Ok(())
     }
 }

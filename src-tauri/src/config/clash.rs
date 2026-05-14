@@ -37,8 +37,9 @@ impl IClashTemp {
         tun.insert("auto-route".into(), true.into());
         tun.insert("strict-route".into(), false.into());
         tun.insert("auto-detect-interface".into(), true.into());
-        tun.insert("dns-hijack".into(), vec!["any:53"].into());
+        tun.insert("dns-hijack".into(), vec!["any:53", "tcp://any:53"].into());
         tun.insert("mtu".into(), 9000.into());
+        tun.insert("inet4-address".into(), vec!["198.18.0.1/30"].into());
 
         map.insert("mixed-port".into(), 7897.into());
         map.insert("socks-port".into(), 7898.into());

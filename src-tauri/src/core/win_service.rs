@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use deelevate::{PrivilegeLevel, Token};
 use runas::Command as RunasCommand;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -107,6 +108,32 @@ pub struct HealthResponse {
     pub data: Option<HealthData>,
 }
 
+
+#[derive(Debug, Deserialize)]
+struct RuntimeConfigsTun {
+    enable: Option<bool>,
+    stack: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeConfigs {
+    tun: Option<RuntimeConfigsTun>,
+    mode: Option<String>,
+}
+
+fn encode_url_path_segment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServiceStatus {
     pub installed: bool,
@@ -116,6 +143,25 @@ pub struct ServiceStatus {
     pub core_pid: Option<u32>,
     pub service_name: String,
     pub message: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct TunDiagnosticReport {
+    pub tun_enabled: bool,
+    pub service_core_managed: bool,
+    pub core_api_ready: bool,
+    pub dns_hijack_ok: bool,
+    pub route_injected: bool,
+    pub multiple_tun_adapters_detected: bool,
+    pub adapter_candidates: Vec<String>,
+    pub mode: Option<String>,
+    pub outbound_group: Option<String>,
+    pub selected_proxy: Option<String>,
+    pub selected_proxy_delay: Option<i64>,
+    pub selected_proxy_reachable: Option<bool>,
+    pub service_log_file: Option<String>,
+    pub service_log_summary: Vec<String>,
+    pub reasons: Vec<String>,
 }
 
 async fn get_service_health() -> Result<HealthResponse> {
@@ -307,20 +353,24 @@ pub(super) async fn run_core_by_service(config_file: &PathBuf) -> Result<()> {
     log::info!(target: "app", "waiting 9097 ready");
     let client = reqwest::ClientBuilder::new().no_proxy().build()?;
     for _ in 0..20 {
-        if client
-            .get(EXTERNAL_CONTROLLER_URL)
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
-        {
-            log::info!(target: "app", "9097 ready success");
-            return Ok(());
+        if let Ok(resp) = client.get(EXTERNAL_CONTROLLER_URL).send().await {
+            if resp.status().is_success() {
+                let cfg = resp.json::<RuntimeConfigs>().await.ok();
+                if let Some(cfg) = cfg {
+                    let tun_enabled = cfg.tun.as_ref().and_then(|t| t.enable).unwrap_or(false);
+                    let tun_stack = cfg.tun.as_ref().and_then(|t| t.stack.clone()).unwrap_or_default();
+                    log::info!(target: "app", "9097 ready success; runtime mode={:?}, tun_enable={}, tun_stack={}", cfg.mode, tun_enabled, tun_stack);
+                    if tun_enabled && !tun_stack.eq_ignore_ascii_case("gvisor") {
+                        log::warn!(target: "app", "TUN stack is not gVisor in runtime config: {}", tun_stack);
+                    }
+                }
+                return Ok(());
+            }
         }
         sleep(Duration::from_millis(300)).await;
     }
     log::error!(target: "app", "9097 ready failure");
-    bail!("service started clash core (pid {:?}) but external-controller 127.0.0.1:9097 is not ready", core_pid)
+    bail!("service started clash core (pid {:?}) but external-controller 127.0.0.1:9097 is not ready. service log file: {}", core_pid, log_path)
 }
 
 pub(super) async fn stop_core_by_service() -> Result<()> {
@@ -337,4 +387,135 @@ pub(super) async fn stop_core_by_service() -> Result<()> {
         bail!(res.msg);
     }
     Ok(())
+}
+
+pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
+    let mut reasons = vec![];
+    let status = check_service().await?;
+    let service_core_managed = status.core_managed;
+    if !service_core_managed {
+        reasons.push("service core not managed".to_string());
+    }
+
+    let client = reqwest::ClientBuilder::new().no_proxy().build()?;
+    let cfg_resp = client.get(EXTERNAL_CONTROLLER_URL).send().await;
+    let core_api_ready = cfg_resp
+        .as_ref()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    if !core_api_ready {
+        reasons.push("core API not ready".to_string());
+    }
+
+    let mut tun_enabled = false;
+    let mut dns_hijack_ok = false;
+    let mut mode = None;
+    if let Ok(resp) = cfg_resp {
+        if let Ok(v) = resp.json::<JsonValue>().await {
+            mode = v.get("mode").and_then(|m| m.as_str()).map(|s| s.to_string());
+            if let Some(tun) = v.get("tun") {
+                tun_enabled = tun.get("enable").and_then(|b| b.as_bool()).unwrap_or(false);
+                dns_hijack_ok = tun
+                    .get("dns-hijack")
+                    .and_then(|d| d.as_array())
+                    .map(|arr| arr.iter().any(|x| x.as_str().unwrap_or("").contains(":53")))
+                    .unwrap_or(false);
+            }
+        }
+    }
+    if !tun_enabled { reasons.push("TUN not enabled".to_string()); }
+    if tun_enabled && !dns_hijack_ok { reasons.push("DNS hijack not working".to_string()); }
+
+    let route_output = StdCommand::new("route").args(["print", "0.0.0.0"]).output().ok();
+    let route_text = route_output.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    let route_injected = route_text.contains("198.18.0.2") || route_text.contains("198.18.0.1");
+    if tun_enabled && !route_injected { reasons.push("route not injected".to_string()); }
+
+    let netsh = StdCommand::new("netsh").args(["interface", "ipv4", "show", "interfaces"]).output().ok();
+    let netsh_text = netsh.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default().to_lowercase();
+    let mut adapter_candidates: Vec<String> = netsh_text
+        .lines()
+        .filter(|l| ["tun", "wintun", "clash", "meta", "mihomo"].iter().any(|k| l.contains(k)))
+        .map(|s| s.trim().to_string())
+        .collect();
+    adapter_candidates.sort();
+    adapter_candidates.dedup();
+    let multiple_tun_adapters_detected = adapter_candidates.len() > 1;
+    if multiple_tun_adapters_detected { reasons.push("multiple TUN adapters detected".to_string()); }
+
+    let mut outbound_group = None;
+    let mut selected_proxy = None;
+    let mut selected_proxy_delay = None;
+    let mut selected_proxy_reachable = None;
+    if core_api_ready {
+        if let Ok(resp) = client.get("http://127.0.0.1:9097/proxies").send().await {
+            if let Ok(v) = resp.json::<JsonValue>().await {
+                let proxies = v.get("proxies").cloned().unwrap_or(JsonValue::Null);
+                for group_name in ["MATCH", "GLOBAL", "🚀 节点选择"] {
+                    if let Some(now) = proxies.get(group_name).and_then(|g| g.get("now")).and_then(|n| n.as_str()) {
+                        outbound_group = Some(group_name.to_string());
+                        selected_proxy = Some(now.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(proxy) = selected_proxy.clone() {
+            let encoded_proxy = encode_url_path_segment(&proxy);
+            let url = format!(
+                "http://127.0.0.1:9097/proxies/{encoded_proxy}/delay?timeout=8000&url=https%3A%2F%2Fwww.google.com%2Fgenerate_204"
+            );
+            if let Ok(resp) = client.get(url).send().await {
+                if let Ok(v) = resp.json::<JsonValue>().await {
+                    selected_proxy_delay = v.get("delay").and_then(|d| d.as_i64());
+                    selected_proxy_reachable = selected_proxy_delay.map(|d| d > 0 && d < 8000);
+                }
+            }
+            if selected_proxy_reachable == Some(false) {
+                reasons.push("TUN is enabled, but selected proxy is not reachable.".to_string());
+            }
+        }
+    }
+
+    let clash_state = get_service_clash_state().await.ok();
+    let service_log_file = clash_state
+        .as_ref()
+        .and_then(|s| s.data.as_ref())
+        .map(|d| d.log_file.clone());
+    let mut service_log_summary = vec![];
+    if let Some(path) = service_log_file.clone() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let keys = ["dial", "proxy", "timeout", "connect", "refused", "handshake", "route", "dns", "tun", "failed"];
+            let lines: Vec<&str> = content.lines().rev().take(200).collect();
+            for line in lines.into_iter().rev() {
+                let l = line.to_lowercase();
+                if keys.iter().any(|k| l.contains(k)) {
+                    let sanitized = line.replace("token=", "token=***");
+                    service_log_summary.push(sanitized);
+                }
+            }
+        }
+    }
+
+    if tun_enabled && dns_hijack_ok && route_injected && selected_proxy_reachable != Some(true) && !reasons.iter().any(|r| r.contains("selected proxy")) {
+        reasons.push("outbound failed, check service log".to_string());
+    }
+
+    Ok(TunDiagnosticReport {
+        tun_enabled,
+        service_core_managed,
+        core_api_ready,
+        dns_hijack_ok,
+        route_injected,
+        multiple_tun_adapters_detected,
+        adapter_candidates,
+        mode,
+        outbound_group,
+        selected_proxy,
+        selected_proxy_delay,
+        selected_proxy_reachable,
+        service_log_file,
+        service_log_summary,
+        reasons,
+    })
 }
