@@ -154,18 +154,29 @@ fn inject_default_proxy_server_nameserver_if_needed(config: &mut Mapping, dns_va
     };
 
     if should_inject {
-        dns_val.insert(
-            Value::from("proxy-server-nameserver"),
-            Value::Sequence(
-                DEFAULT_PROXY_SERVER_NAMESERVER
-                    .iter()
-                    .map(|s| Value::String((*s).to_string()))
-                    .collect(),
-            ),
+        let mut seq = Vec::new();
+        merge_unique_sequence_values(
+            &mut seq,
+            DEFAULT_PROXY_SERVER_NAMESERVER
+                .iter()
+                .map(|s| Value::String((*s).to_string())),
         );
+        dns_val.insert(Value::from("proxy-server-nameserver"), Value::Sequence(seq));
         log::info!(target: "app", "Injected default dns.proxy-server-nameserver for TUN + fake-ip + DNS hijack runtime config");
     } else {
         log::debug!(target: "app", "dns.proxy-server-nameserver already configured, skip injection");
+    }
+}
+
+fn push_unique_sequence_value(seq: &mut Vec<Value>, value: Value) {
+    if !seq.iter().any(|v| v == &value) {
+        seq.push(value);
+    }
+}
+
+fn merge_unique_sequence_values(seq: &mut Vec<Value>, values: impl IntoIterator<Item = Value>) {
+    for value in values {
+        push_unique_sequence_value(seq, value);
     }
 }
 
@@ -321,5 +332,52 @@ mod tests {
             .unwrap();
         assert_eq!(hijack[0].as_str(), Some("tcp://any:53"));
         assert_eq!(tun_out.get("stack").and_then(Value::as_str), Some("system"));
+    }
+
+    #[test]
+    fn use_tun_twice_should_not_duplicate_proxy_server_nameserver() {
+        let c = build_config(true, Some(vec!["any:53"]), Some("fake-ip"), None);
+        let out1 = use_tun(c, true, true, m());
+        let out2 = use_tun(out1, true, true, m());
+        let seq = out2
+            .get("dns")
+            .and_then(Value::as_mapping)
+            .and_then(|d| d.get("proxy-server-nameserver"))
+            .and_then(Value::as_sequence)
+            .unwrap();
+        assert_eq!(seq.len(), 2);
+        assert_eq!(seq[0].as_str(), Some("https://223.5.5.5/dns-query"));
+        assert_eq!(seq[1].as_str(), Some("https://223.6.6.6/dns-query"));
+    }
+
+    #[test]
+    fn merge_unique_sequence_values_should_deduplicate() {
+        let mut seq = vec![Value::from("a"), Value::from("b")];
+        merge_unique_sequence_values(
+            &mut seq,
+            vec![Value::from("b"), Value::from("c"), Value::from("a")],
+        );
+        assert_eq!(seq, vec![Value::from("a"), Value::from("b"), Value::from("c")]);
+    }
+
+    #[test]
+    fn use_tun_twice_should_not_duplicate_dns_hijack() {
+        let mut default_tun = m();
+        default_tun.insert(
+            Value::from("dns-hijack"),
+            Value::Sequence(vec![Value::from("any:53"), Value::from("tcp://any:53")]),
+        );
+        let c = m();
+        let out1 = use_tun(c, true, false, default_tun.clone());
+        let out2 = use_tun(out1, true, true, default_tun);
+        let hijack = out2
+            .get("tun")
+            .and_then(Value::as_mapping)
+            .and_then(|t| t.get("dns-hijack"))
+            .and_then(Value::as_sequence)
+            .unwrap();
+        assert_eq!(hijack.len(), 2);
+        assert_eq!(hijack[0].as_str(), Some("any:53"));
+        assert_eq!(hijack[1].as_str(), Some("tcp://any:53"));
     }
 }

@@ -47,6 +47,7 @@ impl Config {
 
     /// 初始化订阅
     pub fn init_config() -> Result<()> {
+        enhance::ensure_external_merge_rule_template_exists();
         crate::log_err!(Self::generate());
         if let Err(err) = Self::generate_file(ConfigType::Run) {
             log::error!(target: "app", "{err}");
