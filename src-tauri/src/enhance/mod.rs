@@ -135,6 +135,31 @@ fn external_merge_rule_path() -> Option<PathBuf> {
         .and_then(|exe| external_merge_rule_path_from(&exe))
 }
 
+fn external_merge_rule_template() -> &'static str {
+    "# Clash Verge Buty external merge override file\n# This file is loaded after the runtime config is generated.\n# Values here override the generated runtime config.\n#\n# Example for TUN troubleshooting:\n#\n# ipv6: false\n#\n# dns:\n#   ipv6: false\n#\n# tun:\n#   route-exclude-address:\n#     - 223.5.5.5/32\n#     - 223.6.6.6/32\n#\n# Optional: bind outbound traffic to a physical interface.\n# Do not enable this unless you know your interface name.\n#\n# interface-name: WLAN\n"
+}
+
+fn ensure_external_merge_rule_template_exists_at(path: &Path) {
+    if path.exists() {
+        return;
+    }
+
+    if let Err(err) = std::fs::write(path, external_merge_rule_template()) {
+        log::warn!(target: "app", "Failed to create external merge-rule.yaml template ({}): {}", path.display(), err);
+        return;
+    }
+
+    log::info!(target: "app", "Created external merge-rule.yaml template: {}", path.display());
+}
+
+pub fn ensure_external_merge_rule_template_exists() {
+    let Some(path) = external_merge_rule_path() else {
+        return;
+    };
+
+    ensure_external_merge_rule_template_exists_at(&path);
+}
+
 fn load_external_merge_rule(path: &Path) -> Option<Mapping> {
     if !path.exists() {
         return None;
@@ -275,6 +300,15 @@ tun:
     }
 
     #[test]
+    fn deep_merge_should_be_idempotent() {
+        let base = yaml_mapping("dns:\n  enhanced-mode: fake-ip\nrules: [A, B]\n");
+        let overlay = yaml_mapping("dns:\n  ipv6: false\nrules: [C]\n");
+        let once = deep_merge_mapping(base.clone(), overlay.clone());
+        let twice = deep_merge_mapping(once.clone(), overlay);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
     fn load_external_merge_rule_handles_missing_invalid_and_non_mapping() {
         let dir = unique_temp_dir();
         let path = dir.join("merge-rule.yaml");
@@ -296,6 +330,29 @@ tun:
         assert_eq!(loaded.get("ipv6").and_then(Value::as_bool), Some(false));
     }
 
+
+    #[test]
+    fn ensure_template_create_and_keep_existing_content() {
+        let dir = unique_temp_dir();
+        let path = dir.join("merge-rule.yaml");
+
+        ensure_external_merge_rule_template_exists_at(&path);
+        let created = std::fs::read_to_string(&path).unwrap();
+        assert!(created.contains("# Clash Verge Buty external merge override file"));
+
+        std::fs::write(&path, "ipv6: false\n").unwrap();
+        ensure_external_merge_rule_template_exists_at(&path);
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(persisted, "ipv6: false\n");
+    }
+
+    #[test]
+    fn load_external_merge_rule_comment_only_should_skip() {
+        let dir = unique_temp_dir();
+        let path = dir.join("merge-rule.yaml");
+        std::fs::write(&path, external_merge_rule_template()).unwrap();
+        assert!(load_external_merge_rule(&path).is_none());
+    }
     #[test]
     fn resolve_windows_portable_style_path_from_exe_parent() {
         let exe = PathBuf::from(r"C:\UserProgram\Clash.Verge.Buty.Portable\Clash-Verge-Buty.exe");

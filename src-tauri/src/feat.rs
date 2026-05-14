@@ -265,6 +265,7 @@ pub async fn patch_verge(patch: IVerge) -> Result<()> {
 /// 更新某个profile
 /// 如果更新当前订阅就激活订阅
 pub async fn update_profile(uid: String, option: Option<PrfOption>) -> Result<()> {
+    let mut downloaded_remote_yaml = false;
     let url_opt = {
         let profiles = Config::profiles();
         let profiles = profiles.latest();
@@ -284,6 +285,7 @@ pub async fn update_profile(uid: String, option: Option<PrfOption>) -> Result<()
         Some((url, opt)) => {
             let merged_opt = PrfOption::merge(opt, option);
             let item = PrfItem::from_url(&url, None, None, merged_opt).await?;
+            downloaded_remote_yaml = true;
 
             let profiles = Config::profiles();
             let mut profiles = profiles.latest();
@@ -295,7 +297,12 @@ pub async fn update_profile(uid: String, option: Option<PrfOption>) -> Result<()
     };
 
     if should_update {
+        if downloaded_remote_yaml {
+            log::info!(target: "app", "remote profile yaml downloaded, regenerating runtime config through enhance chain");
+        }
         update_core_config().await?;
+    } else if downloaded_remote_yaml {
+        log::info!(target: "app", "remote profile yaml downloaded for non-current profile, runtime config regeneration skipped");
     }
 
     Ok(())
