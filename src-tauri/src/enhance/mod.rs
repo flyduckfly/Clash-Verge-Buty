@@ -330,7 +330,6 @@ tun:
         assert_eq!(loaded.get("ipv6").and_then(Value::as_bool), Some(false));
     }
 
-
     #[test]
     fn ensure_template_create_and_keep_existing_content() {
         let dir = unique_temp_dir();

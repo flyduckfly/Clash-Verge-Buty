@@ -7,6 +7,7 @@ use deelevate::{PrivilegeLevel, Token};
 use runas::Command as RunasCommand;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use serde_yaml::Value as YamlValue;
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -23,6 +24,15 @@ const SERVICE_NAME: &str = "clash-verge-service";
 const SERVICE_BINARY: &str = "clash-verge-service.exe";
 const INSTALL_HELPER: &str = "install-service.exe";
 const UNINSTALL_HELPER: &str = "uninstall-service.exe";
+
+fn read_tun_enable_from_runtime_file(config_file: &str) -> Option<bool> {
+    let content = std::fs::read_to_string(config_file).ok()?;
+    let yaml = serde_yaml::from_str::<YamlValue>(&content).ok()?;
+    yaml.get("tun")
+        .and_then(YamlValue::as_mapping)
+        .and_then(|m| m.get(YamlValue::from("enable")))
+        .and_then(YamlValue::as_bool)
+}
 
 #[derive(Debug)]
 struct ScResult {
@@ -586,6 +596,7 @@ pub(super) async fn run_core_by_service(config_file: &PathBuf) -> Result<()> {
     let config_dir = dirs::path_to_str(&config_dir_buf)?;
     let log_path = dirs::path_to_str(&log_path_buf)?;
     let config_file = dirs::path_to_str(config_file)?;
+    let file_tun_enable = read_tun_enable_from_runtime_file(config_file);
     let mut map = HashMap::new();
     map.insert("core_type", clash_core.as_str());
     map.insert("bin_path", bin_path);
@@ -593,7 +604,7 @@ pub(super) async fn run_core_by_service(config_file: &PathBuf) -> Result<()> {
     map.insert("config_file", config_file);
     map.insert("log_file", log_path);
     log::info!(target: "app", "service mode enabled: calling /start_clash");
-    log::info!(target: "app", "start_clash request field summary: core_type={clash_core}, bin_path_exists={}, config_dir_exists={}, config_file={}, log_file={}", bin_path_buf.exists(), config_dir_buf.exists(), config_file, log_path);
+    log::info!(target: "app", "start_clash request field summary: core_type={clash_core}, bin_path_exists={}, config_dir_exists={}, config_file={}, log_file={}, config_tun_enable={:?}", bin_path_buf.exists(), config_dir_buf.exists(), config_file, log_path, file_tun_enable);
     let res = reqwest::ClientBuilder::new()
         .no_proxy()
         .build()?
