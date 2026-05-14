@@ -121,6 +121,19 @@ struct RuntimeConfigs {
     mode: Option<String>,
 }
 
+fn encode_url_path_segment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServiceStatus {
     pub installed: bool,
@@ -448,7 +461,10 @@ pub async fn diagnose_tun_outbound() -> Result<TunDiagnosticReport> {
             }
         }
         if let Some(proxy) = selected_proxy.clone() {
-            let url = format!("http://127.0.0.1:9097/proxies/{}/delay?timeout=8000&url=https%3A%2F%2Fwww.google.com%2Fgenerate_204", urlencoding::encode(&proxy));
+            let encoded_proxy = encode_url_path_segment(&proxy);
+            let url = format!(
+                "http://127.0.0.1:9097/proxies/{encoded_proxy}/delay?timeout=8000&url=https%3A%2F%2Fwww.google.com%2Fgenerate_204"
+            );
             if let Ok(resp) = client.get(url).send().await {
                 if let Ok(v) = resp.json::<JsonValue>().await {
                     selected_proxy_delay = v.get("delay").and_then(|d| d.as_i64());
