@@ -115,7 +115,16 @@ impl DebugRecorder {
         writeln!(f, "# Clash Verge Debug Record")?;
         writeln!(f, "time={}", chrono::Local::now().to_rfc3339())?;
         writeln!(f, "app_version={}", env!("CARGO_PKG_VERSION"))?;
-        writeln!(f, "mode={:?}", Config::runtime().latest().mode)?;
+        let runtime = Config::runtime();
+        let runtime = runtime.latest();
+        let mode = runtime
+            .config
+            .as_ref()
+            .and_then(|mapping| mapping.get(&serde_yaml::Value::from("mode")))
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        writeln!(f, "mode={}", mode)?;
         writeln!(f, "tun_enable={}", verge.enable_tun_mode.unwrap_or(false))?;
         writeln!(
             f,

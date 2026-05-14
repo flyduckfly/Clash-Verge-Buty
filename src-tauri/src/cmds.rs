@@ -266,7 +266,8 @@ pub fn get_debug_recording_status() -> CmdResult<debug_recorder::DebugRecordingS
 pub fn get_current_log_file_path() -> CmdResult<String> {
     #[cfg(target_os = "windows")]
     {
-        let v = Config::verge().latest();
+        let verge = Config::verge();
+        let v = verge.latest();
         if v.enable_service_mode.unwrap_or(false) {
             let p = wrap_err!(crate::utils::dirs::get_latest_service_log_file())?;
             return Ok(p
