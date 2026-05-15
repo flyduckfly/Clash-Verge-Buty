@@ -375,8 +375,9 @@ pub mod service {
     }
 
     #[tauri::command]
-    pub async fn diagnose_tun_outbound() -> CmdResult<win_service::TunDiagnosticReport> {
-        wrap_err!(win_service::diagnose_tun_outbound().await)
+    pub async fn diagnose_tun_outbound() -> CmdResult<crate::core::diagnostic::TunDiagnosticReport>
+    {
+        wrap_err!(crate::core::diagnostic::diagnose_tun_outbound().await)
     }
 }
 

@@ -357,7 +357,10 @@ mod tests {
             &mut seq,
             vec![Value::from("b"), Value::from("c"), Value::from("a")],
         );
-        assert_eq!(seq, vec![Value::from("a"), Value::from("b"), Value::from("c")]);
+        assert_eq!(
+            seq,
+            vec![Value::from("a"), Value::from("b"), Value::from("c")]
+        );
     }
 
     #[test]

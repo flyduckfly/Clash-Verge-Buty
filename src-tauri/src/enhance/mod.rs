@@ -1,12 +1,12 @@
 mod chain;
 pub mod field;
-mod merge;
+mod merge_rule;
 mod script;
 mod tun;
 
 use self::chain::*;
 use self::field::*;
-use self::merge::*;
+use self::merge_rule::*;
 use self::script::*;
 use self::tun::*;
 use crate::config::Config;

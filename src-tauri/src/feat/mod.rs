@@ -1,9 +1,15 @@
+pub mod clash_patch;
+pub mod system_proxy;
+pub mod verge_patch;
+
+pub use clash_patch::patch_clash;
+pub use verge_patch::patch_verge;
 //！
-//! feat mod 里的函数主要用于
-//! - hotkey 快捷键
-//! - timer 定时器
-//! - cmds 页面调用
-//!
+// feat mod 里的函数主要用于
+// - hotkey 快捷键
+// - timer 定时器
+// - cmds 页面调用
+//
 use crate::config::*;
 use crate::core::*;
 use crate::log_err;
@@ -100,175 +106,6 @@ pub fn toggle_tun_mode() {
             Err(err) => log::error!(target: "app", "{err}"),
         }
     });
-}
-
-/// 修改clash的订阅
-pub async fn patch_clash(patch: Mapping) -> Result<()> {
-    let has_tun_patch = patch.get("tun").is_some();
-    if has_tun_patch {
-        log::info!(target: "app", "patch clash tun config requested");
-        handle::Handle::emit_log("info", "[tun] patch clash tun config requested");
-    }
-    Config::clash().draft().patch_config(patch.clone());
-
-    match {
-        let mixed_port = patch.get("mixed-port");
-        let socks_port = patch.get("socks-port");
-        let port = patch.get("port");
-        let enable_random_port = Config::verge().latest().enable_random_port.unwrap_or(false);
-        if mixed_port.is_some() && !enable_random_port {
-            let changed = mixed_port.unwrap()
-                != Config::verge()
-                    .latest()
-                    .verge_mixed_port
-                    .unwrap_or(Config::clash().data().get_mixed_port());
-            // 检查端口占用
-            if changed {
-                if let Some(port) = mixed_port.unwrap().as_u64() {
-                    if !port_scanner::local_port_available(port as u16) {
-                        Config::clash().discard();
-                        bail!("port already in use");
-                    }
-                }
-            }
-        };
-
-        // 激活订阅
-        if mixed_port.is_some()
-            || socks_port.is_some()
-            || port.is_some()
-            || patch.get("secret").is_some()
-            || patch.get("external-controller").is_some()
-        {
-            Config::generate()?;
-            CoreManager::global().run_core().await?;
-            handle::Handle::refresh_clash();
-        }
-
-        // 更新系统代理
-        if mixed_port.is_some() {
-            log_err!(sysopt::Sysopt::global().init_sysproxy());
-        }
-
-        if patch.get("mode").is_some() {
-            log_err!(handle::Handle::update_systray_part());
-        }
-
-        if has_tun_patch {
-            log::info!(target: "app", "tun config changed, reload core config");
-            handle::Handle::emit_log("info", "[tun] tun config changed, reload core config");
-            update_core_config().await?;
-        }
-
-        Config::runtime().latest().patch_config(patch);
-
-        <Result<()>>::Ok(())
-    } {
-        Ok(()) => {
-            Config::clash().apply();
-            Config::clash().data().save_config()?;
-            Ok(())
-        }
-        Err(err) => {
-            Config::clash().discard();
-            Err(err)
-        }
-    }
-}
-
-/// 修改verge的订阅
-/// 一般都是一个个的修改
-pub async fn patch_verge(patch: IVerge) -> Result<()> {
-    Config::verge().draft().patch_config(patch.clone());
-
-    let tun_mode = patch.enable_tun_mode;
-    let auto_launch = patch.enable_auto_launch;
-    let system_proxy = patch.enable_system_proxy;
-    let proxy_bypass = patch.system_proxy_bypass;
-    let language = patch.language;
-    let port = patch.verge_mixed_port;
-    let common_tray_icon = patch.common_tray_icon;
-    let sysproxy_tray_icon = patch.sysproxy_tray_icon;
-    let tun_tray_icon = patch.tun_tray_icon;
-
-    match {
-        #[cfg(target_os = "windows")]
-        {
-            let service_mode = patch.enable_service_mode;
-            let latest_service_enabled = Config::verge().latest().enable_service_mode.unwrap_or(false);
-            let service_effective_enabled = service_mode.unwrap_or(latest_service_enabled);
-            if let Some(true) = tun_mode {
-                if !service_effective_enabled {
-                    bail!("Tun mode on Windows requires Service Mode. Please enable Service Mode first.");
-                }
-
-                super::core::win_service::ensure_service_ready()
-                    .await
-                    .map_err(|err| anyhow::anyhow!("Tun mode on Windows requires clash-verge-service. {err}"))?;
-            }
-
-            if service_mode.is_some() {
-                log::debug!(target: "app", "change service mode to {}", service_mode.unwrap());
-
-                Config::generate()?;
-                CoreManager::global().run_core().await?;
-            } else if tun_mode.is_some() {
-                // Tun 栈切换（尤其 service mode）经常需要完整重启核心，否则可能出现
-                // runtime / ui 状态不一致，且 core 在 reload 后崩溃触发 recover。
-                if service_effective_enabled {
-                    log::info!(target: "app", "tun mode changed under Windows service mode, restarting core instead of hot reload");
-                    Config::generate()?;
-                    CoreManager::global().run_core().await?;
-                } else {
-                    update_core_config().await?;
-                }
-            }
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        if tun_mode.is_some() {
-            update_core_config().await?;
-        }
-
-        if auto_launch.is_some() {
-            sysopt::Sysopt::global().update_launch()?;
-        }
-        if system_proxy.is_some() || proxy_bypass.is_some() || port.is_some() {
-            sysopt::Sysopt::global().update_sysproxy()?;
-            sysopt::Sysopt::global().guard_proxy();
-        }
-
-        if let Some(true) = patch.enable_proxy_guard {
-            sysopt::Sysopt::global().guard_proxy();
-        }
-
-        if let Some(hotkeys) = patch.hotkeys {
-            hotkey::Hotkey::global().update(hotkeys)?;
-        }
-
-        if language.is_some() {
-            handle::Handle::update_systray()?;
-        } else if system_proxy.is_some()
-            || tun_mode.is_some()
-            || common_tray_icon.is_some()
-            || sysproxy_tray_icon.is_some()
-            || tun_tray_icon.is_some()
-        {
-            handle::Handle::update_systray_part()?;
-        }
-
-        <Result<()>>::Ok(())
-    } {
-        Ok(()) => {
-            Config::verge().apply();
-            Config::verge().data().save_file()?;
-            Ok(())
-        }
-        Err(err) => {
-            Config::verge().discard();
-            Err(err)
-        }
-    }
 }
 
 /// 更新某个profile
