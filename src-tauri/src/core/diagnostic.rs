@@ -1,8 +1,26 @@
 /// diagnostic: diagnostics only; no core start/stop
 #[cfg(target_os = "windows")]
-use anyhow::Result;
+use anyhow::{Context, Result};
 #[cfg(target_os = "windows")]
 use serde::Serialize;
+#[cfg(target_os = "windows")]
+use serde_json::Value as JsonValue;
+#[cfg(target_os = "windows")]
+use serde_yaml::Value as YamlValue;
+#[cfg(target_os = "windows")]
+use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "windows")]
+use std::process::Command as StdCommand;
+#[cfg(target_os = "windows")]
+use std::time::Duration;
+#[cfg(target_os = "windows")]
+use tokio::{net::lookup_host, time::timeout};
+
+#[cfg(target_os = "windows")]
+use super::win_service::{check_service, get_service_clash_state};
+
+#[cfg(target_os = "windows")]
+const EXTERNAL_CONTROLLER_URL: &str = "http://127.0.0.1:9097/configs";
 
 #[cfg(target_os = "windows")]
 #[derive(Debug, Serialize, Clone)]
@@ -34,7 +52,7 @@ pub struct TunDiagnosticReport {
     pub proxy_dns_failed_hosts: Vec<String>,
     pub proxy_dns_failed_targets: Vec<String>,
     pub proxy_dns_failure_hint: Option<String>,
-    pub system_dns_resolved_hosts: Vec<super::win_service::SystemDnsResolvedHost>,
+    pub system_dns_resolved_hosts: Vec<SystemDnsResolvedHost>,
     pub system_dns_status: Option<String>,
     pub dns_proxy_server_nameserver_status: Option<String>,
     pub dns_fake_ip_range: Option<String>,
@@ -575,9 +593,7 @@ pub fn is_likely_fake_ip(ip: &str, config_fake_ip_range: Option<&str>) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub fn classify_system_dns_status(
-    system_dns_resolved_hosts: &[super::win_service::SystemDnsResolvedHost],
-) -> String {
+pub fn classify_system_dns_status(system_dns_resolved_hosts: &[SystemDnsResolvedHost]) -> String {
     if system_dns_resolved_hosts.is_empty() {
         return "failed".to_string();
     }
@@ -615,4 +631,115 @@ pub fn tcp_concurrent_warning_from_logs(
         None
     };
     (only_one_usage_storm, warning)
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Serialize, Clone)]
+pub struct SystemDnsResolvedHost {
+    pub host: String,
+    pub ips: Vec<String>,
+    pub fake_ip_flags: Vec<bool>,
+}
+
+#[cfg(target_os = "windows")]
+fn read_runtime_config_yaml() -> (Option<YamlValue>, String, Option<String>, Option<String>) {
+    let path = match crate::utils::dirs::app_home_dir() {
+        Ok(dir) => dir.join("clash-verge.yaml"),
+        Err(e) => return (None, "unavailable".to_string(), None, Some(e.to_string())),
+    };
+    let path_str = path.to_string_lossy().to_string();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                None,
+                "file".to_string(),
+                Some(path_str),
+                Some(e.to_string()),
+            )
+        }
+    };
+    match serde_yaml::from_str::<YamlValue>(&content).context("parse runtime yaml failed") {
+        Ok(v) => (Some(v), "file".to_string(), Some(path_str), None),
+        Err(e) => (
+            None,
+            "file".to_string(),
+            Some(path_str),
+            Some(e.to_string()),
+        ),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn collect_string_array(value: Option<&JsonValue>) -> Vec<String> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "windows")]
+fn collect_group_names(runtime_yaml: &YamlValue) -> HashSet<String> {
+    runtime_yaml
+        .get("proxy-groups")
+        .and_then(|v| v.as_sequence())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("name").and_then(|v| v.as_str()))
+                .map(|v| v.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "windows")]
+fn extract_match_outbound_from_rules(runtime_yaml: &YamlValue) -> Option<String> {
+    let rules = runtime_yaml.get("rules")?.as_sequence()?;
+    for rule in rules {
+        let line = rule.as_str()?.trim();
+        if let Some((head, tail)) = line.rsplit_once(',') {
+            if head.trim().starts_with("MATCH") {
+                return Some(tail.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn extract_proxy_dns_failures(line: &str) -> Option<(String, Option<String>)> {
+    let lower = line.to_lowercase();
+    if !lower.contains("dns") || !lower.contains("failed") {
+        return None;
+    }
+    let host = line
+        .split_whitespace()
+        .find(|part| is_probably_domain(part.trim_matches(|c: char| ",:()[]".contains(c))))
+        .map(|s| s.trim_matches(|c: char| ",:()[]".contains(c)).to_string());
+    Some((line.to_string(), host))
+}
+
+#[cfg(target_os = "windows")]
+fn is_probably_domain(host: &str) -> bool {
+    host.contains('.') && !host.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+#[cfg(target_os = "windows")]
+fn encode_url_path_segment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
 }

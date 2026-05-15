@@ -1,2 +1,1 @@
-/// sidecar: local core subprocess management
-pub use super::manager::CoreManager;
+// sidecar: local core subprocess management
