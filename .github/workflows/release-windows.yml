@@ -201,6 +201,7 @@ jobs:
         run: |
           pnpm portable ${{ matrix.target }}
         env:
+          SKIP_RELEASE_UPLOAD: "1"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UNSIGNED_BUILD: ${{ steps.sign_mode.outputs.can_sign == 'true' && '0' || '1' }}
 
@@ -240,7 +241,11 @@ jobs:
           $portable = $portableCandidates | Select-Object -First 1
           Copy-Item $portable.FullName (Join-Path $stage $expectedPortable) -Force
 
-          git archive --format=zip --output=(Join-Path $stage $expectedSource) HEAD
+          $sourcePath = Join-Path $stage $expectedSource
+          git archive --format=zip --output="$sourcePath" HEAD
+          if (-not (Test-Path $sourcePath)) {
+            throw "source archive was not created: $sourcePath"
+          }
 
           $actual = Get-ChildItem $stage -File | Sort-Object Name
           Write-Host "[INFO] staging files:"
@@ -261,24 +266,27 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $allowed = @(
+          $expectedAssets = @(
             "Clash-Verge-Buty_${env:VERSION}_x64-setup_unsigned.exe",
             "Clash-Verge-Buty_${env:VERSION}_x64_portable_unsigned.zip",
             "Clash_Verge_Buty-v${env:VERSION}-full-source.zip"
           )
-          $releaseExists = $true
           gh release view "${env:TAG_NAME}" --json id *> $null
           if ($LASTEXITCODE -ne 0) {
-            $releaseExists = $false
             Write-Host "[INFO] release ${env:TAG_NAME} does not exist yet; skip cleanup"
+            exit 0
           }
 
-          if ($releaseExists) {
-            $assets = gh release view "${env:TAG_NAME}" --json assets --jq '.assets[].name'
-            foreach ($name in $assets) {
-              if ($allowed -notcontains $name) {
-                gh release delete-asset "${env:TAG_NAME}" "$name" --yes
+          $existingAssets = gh release view "${env:TAG_NAME}" --json assets --jq '.assets[].name'
+          foreach ($assetName in $expectedAssets) {
+            if ($existingAssets -contains $assetName) {
+              Write-Host "[INFO] deleting existing release asset: $assetName"
+              gh release delete-asset "${env:TAG_NAME}" "$assetName" --yes
+              if ($LASTEXITCODE -ne 0) {
+                throw "failed to delete existing release asset: $assetName"
               }
+            } else {
+              Write-Host "[INFO] release asset not present, no cleanup needed: $assetName"
             }
           }
 
