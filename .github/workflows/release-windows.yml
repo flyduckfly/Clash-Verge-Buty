@@ -201,6 +201,7 @@ jobs:
         run: |
           pnpm portable ${{ matrix.target }}
         env:
+          SKIP_RELEASE_UPLOAD: "1"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UNSIGNED_BUILD: ${{ steps.sign_mode.outputs.can_sign == 'true' && '0' || '1' }}
 
