@@ -201,6 +201,7 @@ jobs:
         run: |
           pnpm portable ${{ matrix.target }}
         env:
+          SKIP_RELEASE_UPLOAD: "1"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UNSIGNED_BUILD: ${{ steps.sign_mode.outputs.can_sign == 'true' && '0' || '1' }}
 
@@ -240,7 +241,11 @@ jobs:
           $portable = $portableCandidates | Select-Object -First 1
           Copy-Item $portable.FullName (Join-Path $stage $expectedPortable) -Force
 
-          git archive --format=zip --output=(Join-Path $stage $expectedSource) HEAD
+          $sourcePath = Join-Path $stage $expectedSource
+          git archive --format=zip --output="$sourcePath" HEAD
+          if (-not (Test-Path $sourcePath)) {
+            throw "source archive was not created: $sourcePath"
+          }
 
           $actual = Get-ChildItem $stage -File | Sort-Object Name
           Write-Host "[INFO] staging files:"
